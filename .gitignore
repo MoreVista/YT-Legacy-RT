@@ -1,0 +1,6 @@
+ARM/
+Release/
+x64
+*.user
+*.filters
+.claude/
