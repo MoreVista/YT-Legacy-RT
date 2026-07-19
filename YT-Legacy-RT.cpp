@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <string>
 #include <vector>
+#include <map>
 
 #pragma comment(lib, "mf.lib")
 #pragma comment(lib, "mfplat.lib")
@@ -40,6 +41,7 @@ enum
 	IDC_SEARCH_EDIT = 100,
 	IDC_SEARCH_BTN,
 	IDC_SETTINGS_BTN,
+	IDC_SUBS_BTN,
 	IDC_LIST,
 	IDC_STATUS,
 	IDC_VIDEO,
@@ -51,10 +53,17 @@ enum
 	IDC_FULLSCREEN_BTN,
 	IDC_REC_LIST,
 	IDC_STATS_LABEL,
+	IDC_CHAN_ICON,
+	IDC_CHAN_NAME,
+	IDC_SUB_BTN,
+	IDC_MINI_THUMB,
+	IDC_MINI_TITLE,
+	IDC_MINI_CLOSE,
 
 	// 設定ウィンドウ
 	IDC_SET_INSTANCE = 200,
 	IDC_SET_QUALITY,
+	IDC_SET_LANGUAGE,
 	IDC_SET_LOCAL,
 	IDC_SET_IGNORECERT,
 	IDC_SET_OK,
@@ -66,11 +75,14 @@ enum
 #define WM_APP_THUMB       (WM_APP + 3)   // wParam: アイテムindex lParam: 検索世代
 #define WM_APP_WATCHINFO   (WM_APP + 4)   // wParam: 動画情報世代
 #define WM_APP_RECTHUMB    (WM_APP + 5)   // wParam: アイテムindex lParam: 動画情報世代
+#define WM_APP_CHANICON    (WM_APP + 6)   // wParam: 動画情報世代 lParam: HBITMAP
+#define WM_APP_MINITHUMB   (WM_APP + 7)   // wParam: 動画情報世代 lParam: HBITMAP
 
 HWND g_hWnd;
 HWND g_hSearchEdit;
 HWND g_hSearchBtn;
 HWND g_hSettingsBtn;
+HWND g_hSubsBtn;
 HWND g_hList;
 HWND g_hStatus;
 HWND g_hVideo;
@@ -82,6 +94,16 @@ HWND g_hTimeLabel;
 HWND g_hFullscreenBtn;
 HWND g_hRecList;
 HWND g_hStatsLabel;
+HWND g_hChanIcon;
+HWND g_hChanName;
+HWND g_hSubBtn;
+HBITMAP g_chanIconBmp = nullptr;   // チャンネルアイコン (STATICに設定中のもの)
+
+// ミニプレイヤー (一覧画面で再生継続中に左下に表示)
+HWND g_hMiniThumb;
+HWND g_hMiniTitle;
+HWND g_hMiniClose;
+HBITMAP g_miniThumbBmp = nullptr;
 
 HBRUSH g_hbrBlack;
 bool g_fullscreen = false;
@@ -93,6 +115,7 @@ HFONT g_hFontSmall;   // カードの投稿者/時間
 
 int  g_dpi = 96;
 bool g_playerMode = false;   // false=一覧 true=プレイヤー
+int  g_listMode = 0;         // ホームのリスト内容: 0=動画 1=登録チャンネル
 
 // 設定 (iniに保存)
 std::wstring g_instanceUrl = L"http://";
@@ -127,6 +150,8 @@ LONG g_searchGen = 0;                  // 検索の世代 (古いスレッドの
 std::vector<VideoItem> g_recResults;   // おすすめ動画 (g_cs で保護)
 std::wstring g_watchStats;             // 再生数・高評価などの表示文字列 (g_cs で保護)
 std::wstring g_nowPlaying;             // 「再生中 (720p DASH)」等 (g_cs で保護)
+std::wstring g_chanId;                 // 再生中動画のチャンネルID (g_cs で保護)
+std::wstring g_chanTitle;              // 同チャンネル名 (g_cs で保護)
 LONG g_recGen = 0;                     // 動画情報の世代
 
 WNDPROC g_oldEditProc = nullptr;
@@ -202,6 +227,236 @@ static std::wstring GetWindowTextStr(HWND h)
 	return s;
 }
 
+// ---------------------------------------------------------------------------
+// 多言語対応
+// 内蔵: 日本語/英語。exeフォルダの lang\<code>.ini (UTF-16LE) があれば上書き。
+// 言語コードは ISO 639-1 (ja, en, fr, ...)。設定が空なら Windows の言語設定に従う。
+// ---------------------------------------------------------------------------
+std::map<std::wstring, std::wstring> g_langMap;   // g_cs で保護
+std::wstring g_langSetting;                        // ""=自動 / "ja" / "en" / 外部ファイルコード
+
+struct LangChoice { std::wstring code; std::wstring display; };
+std::vector<LangChoice> g_langChoices;
+
+static const wchar_t* LANG_EN[][2] = {
+	{ L"lang_auto",       L"Auto (Windows language)" },
+	{ L"search_btn",      L"Search" },
+	{ L"settings_btn",    L"Settings" },
+	{ L"back_btn",        L"\x2190 Back" },
+	{ L"pause_btn",       L"Pause" },
+	{ L"play_btn",        L"Play" },
+	{ L"fullscreen",      L"Fullscreen" },
+	{ L"fullscreen_exit", L"Exit full screen" },
+	{ L"ready",           L"Ready" },
+	{ L"settings_title",  L"Settings" },
+	{ L"instance_label",  L"Invidious instance URL:" },
+	{ L"quality_label",   L"Quality:" },
+	{ L"language_label",  L"Language:" },
+	{ L"local_chk",       L"Play via instance proxy (local=true)" },
+	{ L"cert_chk",        L"Ignore certificate errors" },
+	{ L"ok_btn",          L"OK" },
+	{ L"cancel_btn",      L"Cancel" },
+	{ L"searching",       L"Searching: " },
+	{ L"results_found",   L"%d videos found" },
+	{ L"no_results",      L"No results" },
+	{ L"enter_query",     L"Enter a search term" },
+	{ L"set_instance",    L"Set the instance URL in Settings" },
+	{ L"loading",         L"Loading..." },
+	{ L"loading_n",       L"Loading... (%d/%d)" },
+	{ L"fetching_info",   L"Fetching video info..." },
+	{ L"playing",         L"Playing" },
+	{ L"paused",          L"Paused" },
+	{ L"ended",           L"Playback finished" },
+	{ L"play_failed",     L"Playback failed: " },
+	{ L"fallback_note",   L" *first choice failed: " },
+	{ L"no_dash",         L"no DASH streams" },
+	{ L"info_fail",       L"video info fetch failed" },
+	{ L"unreachable",     L"unreachable" },
+	{ L"audio_suffix",    L" (audio)" },
+	{ L"start_timeout",   L"start timeout" },
+	{ L"direct_suffix",   L"direct" },
+	{ L"cant_fetch",      L" (the instance could not fetch this video)" },
+	{ L"http_error",      L"HTTP error %u" },
+	{ L"net_fail",        L"network failure (error %u)" },
+	{ L"bad_url",         L"invalid URL" },
+	{ L"open_fail",       L"WinHttpOpen failed (code %u)" },
+	{ L"conn_fail",       L"connection failed (WinHttpConnect, code %u, host=%s:%u)" },
+	{ L"req_fail",        L"connection failed (WinHttpOpenRequest, code %u)" },
+	{ L"views_fmt",       L"%s views" },
+	{ L"likes_fmt",       L"%s likes" },
+	{ L"subscribe_btn",   L"Subscribe" },
+	{ L"subscribed_btn",  L"Subscribed" },
+	{ L"subs_btn",        L"Subscriptions" },
+	{ L"channels_found",  L"%d channels" },
+	{ L"no_subs",         L"No subscribed channels" },
+	{ L"num_style",       L"west" },
+};
+
+static const wchar_t* LANG_JA[][2] = {
+	{ L"lang_auto",       L"自動 (Windowsの言語設定)" },
+	{ L"search_btn",      L"検索" },
+	{ L"settings_btn",    L"設定" },
+	{ L"back_btn",        L"\x2190 戻る" },
+	{ L"pause_btn",       L"一時停止" },
+	{ L"play_btn",        L"再生" },
+	{ L"fullscreen",      L"全画面" },
+	{ L"fullscreen_exit", L"全画面解除" },
+	{ L"ready",           L"準備完了" },
+	{ L"settings_title",  L"設定" },
+	{ L"instance_label",  L"InvidiousインスタンスURL:" },
+	{ L"quality_label",   L"画質:" },
+	{ L"language_label",  L"言語:" },
+	{ L"local_chk",       L"インスタンス経由で再生 (local=true)" },
+	{ L"cert_chk",        L"証明書エラーを無視" },
+	{ L"ok_btn",          L"OK" },
+	{ L"cancel_btn",      L"キャンセル" },
+	{ L"searching",       L"検索中: " },
+	{ L"results_found",   L"%d件の動画が見つかりました" },
+	{ L"no_results",      L"結果が0件でした" },
+	{ L"enter_query",     L"検索ワードを入力してください" },
+	{ L"set_instance",    L"設定でインスタンスURLを入力してください" },
+	{ L"loading",         L"読み込み中..." },
+	{ L"loading_n",       L"読み込み中... (%d/%d)" },
+	{ L"fetching_info",   L"動画情報を取得中..." },
+	{ L"playing",         L"再生中" },
+	{ L"paused",          L"一時停止中" },
+	{ L"ended",           L"再生終了" },
+	{ L"play_failed",     L"再生失敗: " },
+	{ L"fallback_note",   L" ※上位候補失敗: " },
+	{ L"no_dash",         L"DASHストリームなし" },
+	{ L"info_fail",       L"動画情報取得失敗" },
+	{ L"unreachable",     L"接続不可" },
+	{ L"audio_suffix",    L" (音声)" },
+	{ L"start_timeout",   L"開始タイムアウト" },
+	{ L"direct_suffix",   L"直接" },
+	{ L"cant_fetch",      L" (インスタンス側でこの動画を取得できていません)" },
+	{ L"http_error",      L"HTTPエラー %u" },
+	{ L"net_fail",        L"通信失敗 (エラーコード %u)" },
+	{ L"bad_url",         L"URLの形式が不正です" },
+	{ L"open_fail",       L"WinHttpOpen失敗 (code %u)" },
+	{ L"conn_fail",       L"接続失敗 (WinHttpConnect, code %u, host=%s:%u)" },
+	{ L"req_fail",        L"接続失敗 (WinHttpOpenRequest, code %u)" },
+	{ L"views_fmt",       L"%s回視聴" },
+	{ L"likes_fmt",       L"高評価 %s" },
+	{ L"subscribe_btn",   L"チャンネル登録" },
+	{ L"subscribed_btn",  L"登録済み" },
+	{ L"subs_btn",        L"登録チャンネル" },
+	{ L"channels_found",  L"%d件のチャンネル" },
+	{ L"no_subs",         L"登録チャンネルはありません" },
+	{ L"num_style",       L"jp" },
+};
+
+static std::wstring GetExeDir()
+{
+	wchar_t path[MAX_PATH] = {};
+	GetModuleFileNameW(nullptr, path, MAX_PATH);
+	wchar_t* slash = wcsrchr(path, L'\\');
+	if (slash) *(slash + 1) = L'\0';
+	return path;
+}
+
+// 翻訳文字列の取得 (キーが無ければキー自身を返す)
+static std::wstring Tr(const wchar_t* key)
+{
+	EnterCriticalSection(&g_cs);
+	std::map<std::wstring, std::wstring>::const_iterator it = g_langMap.find(key);
+	std::wstring result = (it != g_langMap.end()) ? it->second : key;
+	LeaveCriticalSection(&g_cs);
+	return result;
+}
+
+static void LoadLangTableLocked(const wchar_t* (*table)[2], int count)
+{
+	for (int i = 0; i < count; i++)
+		g_langMap[table[i][0]] = table[i][1];
+}
+
+// 外部言語ファイル (UTF-16LE BOMのini) の [Strings] で上書きする
+static void LoadLangFileLocked(const std::wstring& code)
+{
+	std::wstring file = GetExeDir() + L"lang\\" + code + L".ini";
+	if (GetFileAttributesW(file.c_str()) == INVALID_FILE_ATTRIBUTES)
+		return;
+	std::vector<wchar_t> buf(32768, L'\0');
+	GetPrivateProfileSectionW(L"Strings", buf.data(), 32768, file.c_str());
+	const wchar_t* p = buf.data();
+	while (*p)
+	{
+		std::wstring line = p;
+		p += line.size() + 1;
+		size_t eq = line.find(L'=');
+		if (eq != std::wstring::npos && eq > 0)
+		{
+			std::wstring value = line.substr(eq + 1);
+			// 前後の空白が必要な値は引用符で囲めるようにする
+			if (value.size() >= 2 && value[0] == L'"' && value[value.size() - 1] == L'"')
+				value = value.substr(1, value.size() - 2);
+			g_langMap[line.substr(0, eq)] = value;
+		}
+	}
+}
+
+// Windowsの言語設定から言語コードを得る (例: "ja-JP" → "ja")
+static std::wstring AutoLangCode()
+{
+	wchar_t name[LOCALE_NAME_MAX_LENGTH] = {};
+	if (GetUserDefaultLocaleName(name, LOCALE_NAME_MAX_LENGTH) > 0)
+	{
+		std::wstring code = name;
+		size_t dash = code.find(L'-');
+		if (dash != std::wstring::npos)
+			code = code.substr(0, dash);
+		return code;
+	}
+	return L"en";
+}
+
+static void ReloadLanguage()
+{
+	std::wstring code = g_langSetting.empty() ? AutoLangCode() : g_langSetting;
+
+	EnterCriticalSection(&g_cs);
+	g_langMap.clear();
+	// 英語をベースに読み、対象言語で上書き (訳抜けキーは英語表示になる)
+	LoadLangTableLocked(LANG_EN, ARRAYSIZE(LANG_EN));
+	if (code == L"ja")
+		LoadLangTableLocked(LANG_JA, ARRAYSIZE(LANG_JA));
+	LoadLangFileLocked(code);
+	LeaveCriticalSection(&g_cs);
+}
+
+// 設定画面用: 選択可能な言語一覧 (内蔵 + lang\*.ini)
+static void BuildLangChoices()
+{
+	g_langChoices.clear();
+	LangChoice c;
+	c.code = L"";   c.display = Tr(L"lang_auto"); g_langChoices.push_back(c);
+	c.code = L"ja"; c.display = L"日本語";        g_langChoices.push_back(c);
+	c.code = L"en"; c.display = L"English";       g_langChoices.push_back(c);
+
+	WIN32_FIND_DATAW fd;
+	std::wstring pattern = GetExeDir() + L"lang\\*.ini";
+	HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+	if (h != INVALID_HANDLE_VALUE)
+	{
+		do
+		{
+			std::wstring name = fd.cFileName;
+			size_t dot = name.rfind(L'.');
+			std::wstring code = name.substr(0, dot);
+			if (code == L"ja" || code == L"en" || code.empty())
+				continue;
+			wchar_t disp[128] = {};
+			GetPrivateProfileStringW(L"Meta", L"Name", code.c_str(), disp, 128,
+				(GetExeDir() + L"lang\\" + name).c_str());
+			c.code = code;
+			c.display = disp;
+			g_langChoices.push_back(c);
+		} while (FindNextFileW(h, &fd));
+		FindClose(h);
+	}
+}
+
 // ワーカースレッドからステータス欄を更新
 static void PostStatus(const std::wstring& text)
 {
@@ -234,7 +489,7 @@ static bool HttpGet(const std::wstring& url, std::string& out, std::wstring& err
 
 	if (!WinHttpCrackUrl(url.c_str(), (DWORD)url.size(), 0, &uc))
 	{
-		err = L"URLの形式が不正です";
+		err = Tr(L"bad_url");
 		return false;
 	}
 	bool https = (uc.nScheme == INTERNET_SCHEME_HTTPS);
@@ -245,8 +500,8 @@ static bool HttpGet(const std::wstring& url, std::string& out, std::wstring& err
 		WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
 	if (!hOpen)
 	{
-		wchar_t buf[64];
-		wsprintfW(buf, L"WinHttpOpen失敗 (code %u)", GetLastError());
+		wchar_t buf[128];
+		swprintf_s(buf, Tr(L"open_fail").c_str(), GetLastError());
 		err = buf;
 		return false;
 	}
@@ -263,8 +518,8 @@ static bool HttpGet(const std::wstring& url, std::string& out, std::wstring& err
 
 	if (!hConnect)
 	{
-		wchar_t buf[96];
-		wsprintfW(buf, L"接続失敗 (WinHttpConnect, code %u, host=%s:%u)", GetLastError(), host, uc.nPort);
+		wchar_t buf[192];
+		swprintf_s(buf, Tr(L"conn_fail").c_str(), GetLastError(), host, uc.nPort);
 		err = buf;
 	}
 	else
@@ -274,8 +529,8 @@ static bool HttpGet(const std::wstring& url, std::string& out, std::wstring& err
 			https ? WINHTTP_FLAG_SECURE : 0);
 		if (!hRequest)
 		{
-			wchar_t buf[96];
-			wsprintfW(buf, L"接続失敗 (WinHttpOpenRequest, code %u)", GetLastError());
+			wchar_t buf[128];
+			swprintf_s(buf, Tr(L"req_fail").c_str(), GetLastError());
 			err = buf;
 		}
 	}
@@ -320,15 +575,15 @@ static bool HttpGet(const std::wstring& url, std::string& out, std::wstring& err
 			}
 			else
 			{
-				wchar_t buf[64];
-				wsprintfW(buf, L"HTTPエラー %u", status);
+				wchar_t buf[128];
+				swprintf_s(buf, Tr(L"http_error").c_str(), status);
 				err = buf;
 			}
 		}
 		else
 		{
-			wchar_t buf[64];
-			wsprintfW(buf, L"通信失敗 (エラーコード %u)", GetLastError());
+			wchar_t buf[128];
+			swprintf_s(buf, Tr(L"net_fail").c_str(), GetLastError());
 			err = buf;
 		}
 	}
@@ -653,7 +908,7 @@ DWORD WINAPI SearchThread(LPVOID param)
 	SearchParams* sp = (SearchParams*)param;
 
 	std::wstring url = sp->instanceUrl + L"/api/v1/search?type=video&q=" + UrlEncode(sp->query);
-	PostStatus(L"検索中: " + sp->query);
+	PostStatus(Tr(L"searching") + sp->query);
 
 	std::string body;
 	std::wstring err;
@@ -687,7 +942,7 @@ DWORD WINAPI SearchThread(LPVOID param)
 				g_results.push_back(item);
 		}
 		if (g_results.empty())
-			g_searchError = L"結果が0件でした";
+			g_searchError = Tr(L"no_results");
 	}
 	else
 	{
@@ -701,34 +956,161 @@ DWORD WINAPI SearchThread(LPVOID param)
 }
 
 // ---------------------------------------------------------------------------
+// チャンネル登録 (exeフォルダの subscriptions.ini にローカル保存)
+// ---------------------------------------------------------------------------
+static std::wstring GetSubsPath()
+{
+	return GetExeDir() + L"subscriptions.ini";
+}
+
+// BOM付きUTF-16LEで空のiniを作る
+// (ANSIのままだと日本語チャンネル名が ? に潰れて保存されるため)
+static void CreateSubsFileWithBom(const std::wstring& path)
+{
+	HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
+		CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (h == INVALID_HANDLE_VALUE) return;
+	const wchar_t header[] = L"\xFEFF[Subscriptions]\r\n";
+	DWORD written = 0;
+	WriteFile(h, header, (DWORD)(wcslen(header) * sizeof(wchar_t)), &written, nullptr);
+	CloseHandle(h);
+}
+
+// subscriptions.ini がUTF-16LEであることを保証する (無ければ作成、ANSIなら移行)
+static void EnsureSubsFileUnicode()
+{
+	std::wstring path = GetSubsPath();
+
+	HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+		FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+	if (h == INVALID_HANDLE_VALUE)
+	{
+		CreateSubsFileWithBom(path);
+		return;
+	}
+	BYTE bom[2] = {};
+	DWORD read = 0;
+	ReadFile(h, bom, 2, &read, nullptr);
+	CloseHandle(h);
+	if (read >= 2 && bom[0] == 0xFF && bom[1] == 0xFE)
+		return;   // 既にUTF-16LE
+
+	// ANSIで作られた既存ファイルをUTF-16LEへ移行 (チャンネルIDは保持される)
+	std::vector<wchar_t> buf(32768, L'\0');
+	GetPrivateProfileSectionW(L"Subscriptions", buf.data(), 32768, path.c_str());
+	WritePrivateProfileStringW(nullptr, nullptr, nullptr, path.c_str());   // キャッシュ書き出し
+	CreateSubsFileWithBom(path);
+	const wchar_t* p = buf.data();
+	while (*p)
+	{
+		std::wstring line = p;
+		p += line.size() + 1;
+		size_t eq = line.find(L'=');
+		if (eq != std::wstring::npos && eq > 0)
+			WritePrivateProfileStringW(L"Subscriptions",
+				line.substr(0, eq).c_str(), line.substr(eq + 1).c_str(), path.c_str());
+	}
+}
+
+static bool IsSubscribed(const std::wstring& channelId)
+{
+	if (channelId.empty()) return false;
+	wchar_t buf[8] = {};
+	GetPrivateProfileStringW(L"Subscriptions", channelId.c_str(), L"", buf, 8, GetSubsPath().c_str());
+	return buf[0] != L'\0';
+}
+
+static void SetSubscribed(const std::wstring& channelId, const std::wstring& name, bool subscribe)
+{
+	if (channelId.empty()) return;
+	EnsureSubsFileUnicode();
+	WritePrivateProfileStringW(L"Subscriptions", channelId.c_str(),
+		subscribe ? (name.empty() ? L"1" : name.c_str()) : nullptr,
+		GetSubsPath().c_str());
+}
+
+// ---------------------------------------------------------------------------
 // 動画情報 (再生数・高評価・おすすめ) の取得
 // ---------------------------------------------------------------------------
 
-// 12345 → "1.2万" のような略記
+// local=true時のAPIは相対パス (/videoplayback?...) を返すため絶対URL化する
+static std::wstring AbsolutizeUrl(const std::wstring& u, const std::wstring& instanceUrl)
+{
+	if (u.find(L"http://") == 0 || u.find(L"https://") == 0)
+		return u;
+	if (u.find(L"//") == 0)
+	{
+		// プロトコル相対 → インスタンスのスキームを補完
+		size_t p = instanceUrl.find(L"://");
+		if (p != std::wstring::npos)
+			return instanceUrl.substr(0, p + 1) + u;
+		return L"http:" + u;
+	}
+	if (!u.empty() && u[0] == L'/')
+		return instanceUrl + u;
+	return u;
+}
+
+// 12345 → "1.2万" / "12.3K" のような略記 (言語の num_style に従う)
+// 注意: wsprintfW は %lld 非対応のため swprintf_s を使うこと
 static std::wstring FormatCompact(long long n)
 {
 	wchar_t buf[64];
 	if (n < 0) return std::wstring();
-	// 注意: wsprintfW は %lld 非対応のため swprintf_s を使うこと
-	if (n >= 100000000)
+
+	if (Tr(L"num_style") == L"jp")
 	{
-		long long x10 = n * 10 / 100000000;  // 0.1億単位
-		if (x10 % 10)
-			swprintf_s(buf, L"%lld.%lld億", x10 / 10, x10 % 10);
+		if (n >= 100000000)
+		{
+			long long x10 = n * 10 / 100000000;  // 0.1億単位
+			if (x10 % 10)
+				swprintf_s(buf, L"%lld.%lld億", x10 / 10, x10 % 10);
+			else
+				swprintf_s(buf, L"%lld億", x10 / 10);
+		}
+		else if (n >= 10000)
+		{
+			long long x10 = n * 10 / 10000;      // 0.1万単位
+			if (n < 100000 && x10 % 10)
+				swprintf_s(buf, L"%lld.%lld万", x10 / 10, x10 % 10);
+			else
+				swprintf_s(buf, L"%lld万", x10 / 10);
+		}
 		else
-			swprintf_s(buf, L"%lld億", x10 / 10);
-	}
-	else if (n >= 10000)
-	{
-		long long x10 = n * 10 / 10000;      // 0.1万単位
-		if (n < 100000 && x10 % 10)
-			swprintf_s(buf, L"%lld.%lld万", x10 / 10, x10 % 10);
-		else
-			swprintf_s(buf, L"%lld万", x10 / 10);
+		{
+			swprintf_s(buf, L"%lld", n);
+		}
 	}
 	else
 	{
-		swprintf_s(buf, L"%lld", n);
+		if (n >= 1000000000)
+		{
+			long long x10 = n * 10 / 1000000000;
+			if (x10 % 10)
+				swprintf_s(buf, L"%lld.%lldB", x10 / 10, x10 % 10);
+			else
+				swprintf_s(buf, L"%lldB", x10 / 10);
+		}
+		else if (n >= 1000000)
+		{
+			long long x10 = n * 10 / 1000000;
+			if (n < 10000000 && x10 % 10)
+				swprintf_s(buf, L"%lld.%lldM", x10 / 10, x10 % 10);
+			else
+				swprintf_s(buf, L"%lldM", x10 / 10);
+		}
+		else if (n >= 1000)
+		{
+			long long x10 = n * 10 / 1000;
+			if (n < 10000 && x10 % 10)
+				swprintf_s(buf, L"%lld.%lldK", x10 / 10, x10 % 10);
+			else
+				swprintf_s(buf, L"%lldK", x10 / 10);
+		}
+		else
+		{
+			swprintf_s(buf, L"%lld", n);
+		}
 	}
 	return buf;
 }
@@ -785,6 +1167,7 @@ DWORD WINAPI WatchThread(LPVOID param)
 
 	std::wstring stats;
 	std::vector<VideoItem> recs;
+	std::wstring chanId, chanTitle, iconUrl;
 	if (ok)
 	{
 		std::wstring json = Utf8ToWide(body);
@@ -801,7 +1184,11 @@ DWORD WINAPI WatchThread(LPVOID param)
 			item.author = JsonGetString(objs[i], L"author");
 			long long views = JsonGetNumber(objs[i], L"viewCount");
 			if (views >= 0)
-				item.author += L"・" + FormatCompact(views) + L"回視聴";
+			{
+				wchar_t tmp[96];
+				swprintf_s(tmp, Tr(L"views_fmt").c_str(), FormatCompact(views).c_str());
+				item.author += std::wstring(L"・") + tmp;
+			}
 			item.lengthSeconds = JsonGetNumber(objs[i], L"lengthSeconds");
 			item.thumb = nullptr;
 			if (!item.videoId.empty())
@@ -816,10 +1203,39 @@ DWORD WINAPI WatchThread(LPVOID param)
 		std::wstring author = JsonGetString(top, L"author");
 		std::wstring published = JsonGetString(top, L"publishedText");
 
+		// チャンネル情報 (アイコンは76px以上の最小サイズを選ぶ)
+		chanId = JsonGetString(top, L"authorId");
+		chanTitle = author;
+		{
+			std::wstring thumbArr = JsonGetArray(top, L"authorThumbnails");
+			std::vector<std::wstring> tobjs;
+			SplitTopLevelObjects(thumbArr, tobjs);
+			for (size_t t = 0; t < tobjs.size(); t++)
+			{
+				std::wstring u = JsonGetString(tobjs[t], L"url");
+				if (u.empty()) continue;
+				iconUrl = u;
+				if (JsonGetNumber(tobjs[t], L"width") >= 76)
+					break;
+			}
+			iconUrl = AbsolutizeUrl(iconUrl, wp->instanceUrl);
+			// プロキシ有効時はggpht直アクセスを避けインスタンス経由にする
+			size_t gp = iconUrl.find(L"ggpht.com/");
+			if (g_localProxy && gp != std::wstring::npos)
+				iconUrl = wp->instanceUrl + L"/ggpht/" + iconUrl.substr(gp + 10);
+		}
+
+		wchar_t tmp[128];
 		if (views >= 0)
-			stats += FormatCompact(views) + L"回視聴";
+		{
+			swprintf_s(tmp, Tr(L"views_fmt").c_str(), FormatCompact(views).c_str());
+			stats += tmp;
+		}
 		if (likes >= 0)
-			stats += (stats.empty() ? L"" : L"　") + std::wstring(L"高評価 ") + FormatCompact(likes);
+		{
+			swprintf_s(tmp, Tr(L"likes_fmt").c_str(), FormatCompact(likes).c_str());
+			stats += (stats.empty() ? L"" : L"　") + std::wstring(tmp);
+		}
 		if (!author.empty())
 			stats += (stats.empty() ? L"" : L"　") + author;
 		if (!published.empty())
@@ -832,8 +1248,36 @@ DWORD WINAPI WatchThread(LPVOID param)
 		ClearRecLocked();
 		g_recResults.swap(recs);
 		g_watchStats = stats;
+		g_chanId = chanId;
+		g_chanTitle = chanTitle;
 		LeaveCriticalSection(&g_cs);
 		PostMessageW(g_hWnd, WM_APP_WATCHINFO, (WPARAM)wp->gen, 0);
+
+		// チャンネルアイコンを取得 (失敗しても無視)
+		if (!iconUrl.empty())
+		{
+			std::string img;
+			std::wstring ierr;
+			if (HttpGet(iconUrl, img, ierr))
+			{
+				HBITMAP bmp = DecodeImageToBitmap(img, S(36), S(36));
+				if (bmp && !PostMessageW(g_hWnd, WM_APP_CHANICON, (WPARAM)wp->gen, (LPARAM)bmp))
+					DeleteObject(bmp);
+			}
+		}
+
+		// ミニプレイヤー用サムネイルを取得 (失敗しても無視)
+		{
+			std::wstring turl = wp->instanceUrl + L"/vi/" + wp->videoId + L"/mqdefault.jpg";
+			std::string img;
+			std::wstring terr;
+			if (HttpGet(turl, img, terr))
+			{
+				HBITMAP bmp = DecodeImageToBitmap(img, S(72), S(40));
+				if (bmp && !PostMessageW(g_hWnd, WM_APP_MINITHUMB, (WPARAM)wp->gen, (LPARAM)bmp))
+					DeleteObject(bmp);
+			}
+		}
 	}
 	else
 	{
@@ -841,6 +1285,68 @@ DWORD WINAPI WatchThread(LPVOID param)
 	}
 
 	delete wp;
+	return 0;
+}
+
+// ---------------------------------------------------------------------------
+// チャンネルの動画一覧 (検索結果リストに表示する)
+// ---------------------------------------------------------------------------
+struct ChannelParams
+{
+	LONG gen;
+	std::wstring instanceUrl;
+	std::wstring channelId;
+};
+
+DWORD WINAPI ChannelThread(LPVOID param)
+{
+	ChannelParams* cp = (ChannelParams*)param;
+
+	std::wstring url = cp->instanceUrl + L"/api/v1/channels/" + cp->channelId + L"/videos";
+	std::string body;
+	std::wstring err;
+	bool ok = HttpGet(url, body, err);
+
+	EnterCriticalSection(&g_cs);
+	if (cp->gen != g_searchGen)
+	{
+		LeaveCriticalSection(&g_cs);
+		delete cp;
+		return 0;
+	}
+	ClearResultsLocked();
+	g_searchError.clear();
+	if (ok)
+	{
+		std::wstring json = Utf8ToWide(body);
+		// 新APIは {"videos":[...]} 、旧APIはトップレベル配列
+		std::wstring arr = JsonGetArray(json, L"videos");
+		if (arr.empty())
+			arr = json;
+		std::vector<std::wstring> objs;
+		SplitTopLevelObjects(arr, objs);
+		for (size_t i = 0; i < objs.size(); i++)
+		{
+			VideoItem item;
+			item.videoId = JsonGetString(objs[i], L"videoId");
+			item.title = JsonGetString(objs[i], L"title");
+			item.author = JsonGetString(objs[i], L"author");
+			item.lengthSeconds = JsonGetNumber(objs[i], L"lengthSeconds");
+			item.thumb = nullptr;
+			if (!item.videoId.empty())
+				g_results.push_back(item);
+		}
+		if (g_results.empty())
+			g_searchError = Tr(L"no_results");
+	}
+	else
+	{
+		g_searchError = err;
+	}
+	LeaveCriticalSection(&g_cs);
+
+	PostMessageW(g_hWnd, WM_APP_SEARCHDONE, (WPARAM)cp->gen, 0);
+	delete cp;
 	return 0;
 }
 
@@ -907,7 +1413,7 @@ public:
 			InterlockedExchange(&g_sessionErrorHr, (LONG)status);
 
 		if (met == MESessionEnded)
-			PostStatus(L"再生終了");
+			PostStatus(Tr(L"ended"));
 
 		ev->Release();
 
@@ -1180,9 +1686,9 @@ static void TogglePause()
 		PropVariantInit(&var);  // VT_EMPTY = 現在位置から再開
 		g_pSession->Start(&GUID_NULL, &var);
 		g_isPaused = false;
-		SetWindowTextW(g_hPlayPauseBtn, L"一時停止");
+		SetWindowTextW(g_hPlayPauseBtn, Tr(L"pause_btn").c_str());
 		EnterCriticalSection(&g_cs);
-		std::wstring s = g_nowPlaying.empty() ? L"再生中" : g_nowPlaying;
+		std::wstring s = g_nowPlaying.empty() ? Tr(L"playing") : g_nowPlaying;
 		LeaveCriticalSection(&g_cs);
 		SetStatus(s);
 	}
@@ -1190,8 +1696,8 @@ static void TogglePause()
 	{
 		g_pSession->Pause();
 		g_isPaused = true;
-		SetWindowTextW(g_hPlayPauseBtn, L"再生");
-		SetStatus(L"一時停止中");
+		SetWindowTextW(g_hPlayPauseBtn, Tr(L"play_btn").c_str());
+		SetStatus(Tr(L"paused"));
 	}
 }
 
@@ -1241,24 +1747,6 @@ struct PlayParams
 	int quality;        // 目標の高さ (480/720/1080)。0ならDASHを使わない
 	bool localProxy;
 };
-
-// local=true時のAPIは相対パス (/videoplayback?...) を返すため絶対URL化する
-static std::wstring AbsolutizeUrl(const std::wstring& u, const std::wstring& instanceUrl)
-{
-	if (u.find(L"http://") == 0 || u.find(L"https://") == 0)
-		return u;
-	if (u.find(L"//") == 0)
-	{
-		// プロトコル相対 → インスタンスのスキームを補完
-		size_t p = instanceUrl.find(L"://");
-		if (p != std::wstring::npos)
-			return instanceUrl.substr(0, p + 1) + u;
-		return L"http:" + u;
-	}
-	if (!u.empty() && u[0] == L'/')
-		return instanceUrl + u;
-	return u;
-}
 
 // "bitrate":"123456" (文字列) と "bitrate":123456 (数値) の両方に対応
 static long long JsonGetNumberFlexible(const std::wstring& obj, const wchar_t* key)
@@ -1372,7 +1860,7 @@ DWORD WINAPI PlayThread(LPVOID param)
 	// プロキシ経由 (local=true、相対URLで返るため絶対化) と直接URLの両方を用意
 	if (pp->quality > 0 && !pp->videoId.empty())
 	{
-		PostStatus(L"動画情報を取得中...");
+		PostStatus(Tr(L"fetching_info"));
 		std::wstring apiBase = pp->instanceUrl + L"/api/v1/videos/" + pp->videoId;
 
 		std::vector<PlayCandidate> dashCands;
@@ -1386,7 +1874,7 @@ DWORD WINAPI PlayThread(LPVOID param)
 			std::wstring err;
 			if (!HttpGet(apiBase + (useLocal ? L"?local=true" : L""), body, err))
 			{
-				lastErr = L"動画情報取得失敗 (" + err + L")";
+				lastErr = Tr(L"info_fail") + L" (" + err + L")";
 				continue;
 			}
 
@@ -1397,12 +1885,12 @@ DWORD WINAPI PlayThread(LPVOID param)
 				dash.video = AbsolutizeUrl(dash.video, pp->instanceUrl);
 				dash.audio = AbsolutizeUrl(dash.audio, pp->instanceUrl);
 				if (!useLocal)
-					dash.label += L" 直接";
+					dash.label += L" " + Tr(L"direct_suffix");
 				dashCands.push_back(dash);
 			}
 			else
 			{
-				lastErr = L"DASHストリームなし";
+				lastErr = Tr(L"no_dash");
 			}
 		}
 		pp->urls.insert(pp->urls.begin(), dashCands.begin(), dashCands.end());
@@ -1412,8 +1900,8 @@ DWORD WINAPI PlayThread(LPVOID param)
 	{
 		if (pp->urls.size() > 1)
 		{
-			wchar_t buf[64];
-			swprintf_s(buf, L"読み込み中... (%d/%d)", (int)i + 1, (int)pp->urls.size());
+			wchar_t buf[128];
+			swprintf_s(buf, Tr(L"loading_n").c_str(), (int)i + 1, (int)pp->urls.size());
 			PostStatus(buf);
 		}
 
@@ -1426,10 +1914,11 @@ DWORD WINAPI PlayThread(LPVOID param)
 			HRESULT hr = Play(fileUrl, nullptr);
 			if (SUCCEEDED(hr))
 			{
+				std::wstring playing = Tr(L"playing");
 				EnterCriticalSection(&g_cs);
-				g_nowPlaying = L"再生中";
+				g_nowPlaying = playing;
 				LeaveCriticalSection(&g_cs);
-				PostStatus(L"再生中");
+				PostStatus(playing);
 				played = true;
 				break;
 			}
@@ -1444,24 +1933,33 @@ DWORD WINAPI PlayThread(LPVOID param)
 		DWORD status = 0;
 		if (!ProbeStreamUrl(c.video, resolvedVideo, status))
 		{
-			wchar_t buf[64];
 			if (status != 0)
+			{
+				wchar_t buf[64];
 				swprintf_s(buf, L"HTTP %u", status);
+				lastErr = buf;
+			}
 			else
-				swprintf_s(buf, L"接続不可");
-			lastErr = buf;
+			{
+				lastErr = Tr(L"unreachable");
+			}
 			continue;
 		}
 		if (!c.audio.empty())
 		{
 			if (!ProbeStreamUrl(c.audio, resolvedAudio, status))
 			{
-				wchar_t buf[64];
 				if (status != 0)
-					swprintf_s(buf, L"HTTP %u (音声)", status);
+				{
+					wchar_t buf[64];
+					swprintf_s(buf, L"HTTP %u", status);
+					lastErr = buf;
+				}
 				else
-					swprintf_s(buf, L"接続不可 (音声)");
-				lastErr = buf;
+				{
+					lastErr = Tr(L"unreachable");
+				}
+				lastErr += Tr(L"audio_suffix");
 				continue;
 			}
 		}
@@ -1475,11 +1973,11 @@ DWORD WINAPI PlayThread(LPVOID param)
 			if (WaitForPlaybackStart(&startErr, 20000))
 			{
 				// 再生中の解像度と、フォールバックした場合はその理由を表示
-				std::wstring msg = L"再生中";
+				std::wstring msg = Tr(L"playing");
 				if (!c.label.empty())
 					msg += L" (" + c.label + L")";
 				if (i > 0 && !lastErr.empty())
-					msg += L" ※上位候補失敗: " + lastErr;
+					msg += Tr(L"fallback_note") + lastErr;
 
 				EnterCriticalSection(&g_cs);
 				g_nowPlaying = msg;
@@ -1493,12 +1991,16 @@ DWORD WINAPI PlayThread(LPVOID param)
 			Cleanup();
 		}
 
-		wchar_t buf[64];
 		if (hr == E_PENDING)
-			lstrcpyW(buf, L"開始タイムアウト");
+		{
+			lastErr = Tr(L"start_timeout");
+		}
 		else
+		{
+			wchar_t buf[64];
 			swprintf_s(buf, L"hr=0x%08X", (unsigned)hr);
-		lastErr = buf;
+			lastErr = buf;
+		}
 		if (!c.label.empty())
 			lastErr += L" (" + c.label + L")";
 	}
@@ -1506,9 +2008,9 @@ DWORD WINAPI PlayThread(LPVOID param)
 	if (!played)
 	{
 		Cleanup();
-		std::wstring msg = L"再生失敗: " + lastErr;
+		std::wstring msg = Tr(L"play_failed") + lastErr;
 		if (lastErr.find(L"HTTP 4") == 0 || lastErr.find(L"HTTP 5") == 0)
-			msg += L" (インスタンス側でこの動画を取得できていません)";
+			msg += Tr(L"cant_fetch");
 		PostStatus(msg);
 	}
 
@@ -1542,6 +2044,9 @@ static void LoadSettings()
 	if (g_qualityIdx < 0 || g_qualityIdx > 3) g_qualityIdx = 0;
 	g_localProxy = GetPrivateProfileIntW(L"Settings", L"LocalProxy", 1, ini.c_str()) != 0;
 	g_ignoreCert = GetPrivateProfileIntW(L"Settings", L"IgnoreCert", 0, ini.c_str()) != 0;
+
+	GetPrivateProfileStringW(L"Settings", L"Language", L"", buf, 1024, ini.c_str());
+	g_langSetting = buf;
 }
 
 static void SaveSettings()
@@ -1556,6 +2061,7 @@ static void SaveSettings()
 	WritePrivateProfileStringW(L"Settings", L"LocalProxy", num, ini.c_str());
 	wsprintfW(num, L"%d", g_ignoreCert ? 1 : 0);
 	WritePrivateProfileStringW(L"Settings", L"IgnoreCert", num, ini.c_str());
+	WritePrivateProfileStringW(L"Settings", L"Language", g_langSetting.c_str(), ini.c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -1577,11 +2083,30 @@ static void EnterPlayerView(const std::wstring& title)
 	g_userSeeking = false;
 	g_seekBarMax = -1;
 	SetWindowTextW(g_hPlayerTitle, title.c_str());
-	SetWindowTextW(g_hPlayPauseBtn, L"一時停止");
+	SetWindowTextW(g_hPlayPauseBtn, Tr(L"pause_btn").c_str());
 	SetWindowTextW(g_hTimeLabel, L"--:-- / --:--");
 	SetWindowTextW(g_hStatsLabel, L"");
 	SendMessageW(g_hSeekBar, TBM_SETPOS, TRUE, 0);
 	SendMessageW(g_hRecList, LB_RESETCONTENT, 0, 0);
+
+	// チャンネルバーを初期化
+	SetWindowTextW(g_hChanName, L"");
+	SetWindowTextW(g_hSubBtn, Tr(L"subscribe_btn").c_str());
+	EnableWindow(g_hSubBtn, FALSE);
+	{
+		HBITMAP old = (HBITMAP)SendMessageW(g_hChanIcon, STM_SETIMAGE, IMAGE_BITMAP, 0);
+		if (old) DeleteObject(old);
+		g_chanIconBmp = nullptr;
+	}
+
+	// ミニプレイヤーを初期化 (新しい動画のタイトル/サムネイルに差し替え)
+	SetWindowTextW(g_hMiniTitle, title.c_str());
+	{
+		HBITMAP old = (HBITMAP)SendMessageW(g_hMiniThumb, STM_SETIMAGE, IMAGE_BITMAP, 0);
+		if (old) DeleteObject(old);
+		g_miniThumbBmp = nullptr;
+	}
+
 	Layout(g_hWnd);
 	RefreshAll();
 }
@@ -1591,7 +2116,22 @@ static void LeavePlayerView()
 	if (g_fullscreen)
 		ToggleFullscreen();
 	g_playerMode = false;
-	Cleanup();
+	// 再生は停止せず継続する (一覧画面ではミニプレイヤーが表示される)
+	Layout(g_hWnd);
+	RefreshAll();
+}
+
+// ミニプレイヤーのクリック → プレイヤービューへ復帰
+static void ReturnToPlayer()
+{
+	if (g_playerMode || !g_pSession)
+		return;
+	g_playerMode = true;
+	EnterCriticalSection(&g_cs);
+	std::wstring s = g_nowPlaying;
+	LeaveCriticalSection(&g_cs);
+	if (!s.empty() && !g_isPaused)
+		SetStatus(s);
 	Layout(g_hWnd);
 	RefreshAll();
 }
@@ -1601,7 +2141,7 @@ static void PlayVideoId(const std::wstring& videoId, const std::wstring& title)
 	std::wstring instanceUrl = TrimTrailingSlash(g_instanceUrl);
 	if (instanceUrl.empty() || instanceUrl == L"http://" || instanceUrl == L"https://")
 	{
-		SetStatus(L"設定でインスタンスURLを入力してください");
+		SetStatus(Tr(L"set_instance"));
 		return;
 	}
 
@@ -1624,11 +2164,11 @@ static void PlayVideoId(const std::wstring& videoId, const std::wstring& title)
 		pp->urls.push_back(c);
 	}
 	c.video = base;
-	c.label = L"360p 直接";
+	c.label = L"360p " + Tr(L"direct_suffix");
 	pp->urls.push_back(c);
 
 	EnterPlayerView(title);
-	SetStatus(L"読み込み中...");
+	SetStatus(Tr(L"loading"));
 	CreateThread(nullptr, 0, PlayThread, pp, 0, nullptr);
 
 	// 再生数・高評価・おすすめ動画をバックグラウンドで取得
@@ -1637,6 +2177,51 @@ static void PlayVideoId(const std::wstring& videoId, const std::wstring& title)
 	wpr->instanceUrl = instanceUrl;
 	wpr->videoId = videoId;
 	CreateThread(nullptr, 0, WatchThread, wpr, 0, nullptr);
+}
+
+// 指定チャンネルの動画一覧の取得を開始する (結果はホームのリストへ)
+static void StartChannelVideos(const std::wstring& channelId)
+{
+	if (channelId.empty())
+		return;
+
+	ChannelParams* cp = new ChannelParams;
+	cp->gen = InterlockedIncrement(&g_searchGen);
+	cp->instanceUrl = TrimTrailingSlash(g_instanceUrl);
+	cp->channelId = channelId;
+
+	SetStatus(Tr(L"loading"));
+	CreateThread(nullptr, 0, ChannelThread, cp, 0, nullptr);
+}
+
+// チャンネル名/アイコンのクリック → そのチャンネルの動画一覧を表示
+static void OpenChannelVideos()
+{
+	std::wstring channelId;
+	EnterCriticalSection(&g_cs);
+	channelId = g_chanId;
+	LeaveCriticalSection(&g_cs);
+	if (channelId.empty())
+		return;
+
+	LeavePlayerView();
+	StartChannelVideos(channelId);
+}
+
+// チャンネル登録の切り替え
+static void ToggleSubscribe()
+{
+	std::wstring channelId, name;
+	EnterCriticalSection(&g_cs);
+	channelId = g_chanId;
+	name = g_chanTitle;
+	LeaveCriticalSection(&g_cs);
+	if (channelId.empty())
+		return;
+
+	bool nowSub = !IsSubscribed(channelId);
+	SetSubscribed(channelId, name, nowSub);
+	SetWindowTextW(g_hSubBtn, Tr(nowSub ? L"subscribed_btn" : L"subscribe_btn").c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -1650,9 +2235,11 @@ static HWND CreateLabel(HWND parent, const wchar_t* text, int x, int y, int w)
 	return h;
 }
 
+static void ApplyUiTexts();
+
 LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 {
-	static HWND hInst, hQuality, hLocal, hCert;
+	static HWND hInst, hQuality, hLang, hLocal, hCert;
 
 	switch (msg)
 	{
@@ -1661,17 +2248,17 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 		int M = S(12);
 		int y = M;
 
-		CreateLabel(hWnd, L"InvidiousインスタンスURL:", M, y, S(300));
+		CreateLabel(hWnd, Tr(L"instance_label").c_str(), M, y, S(300));
 		y += S(22);
 		hInst = CreateWindowW(L"EDIT", g_instanceUrl.c_str(),
 			WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
 			M, y, S(360), S(26), hWnd, (HMENU)IDC_SET_INSTANCE, nullptr, nullptr);
 		y += S(36);
 
-		CreateLabel(hWnd, L"画質:", M, y + S(3), S(60));
+		CreateLabel(hWnd, Tr(L"quality_label").c_str(), M, y + S(3), S(80));
 		hQuality = CreateWindowW(L"COMBOBOX", nullptr,
 			WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
-			M + S(66), y, S(130), S(200), hWnd, (HMENU)IDC_SET_QUALITY, nullptr, nullptr);
+			M + S(86), y, S(130), S(200), hWnd, (HMENU)IDC_SET_QUALITY, nullptr, nullptr);
 		SendMessageW(hQuality, CB_ADDSTRING, 0, (LPARAM)L"360p");
 		SendMessageW(hQuality, CB_ADDSTRING, 0, (LPARAM)L"480p (DASH)");
 		SendMessageW(hQuality, CB_ADDSTRING, 0, (LPARAM)L"720p (DASH)");
@@ -1679,22 +2266,39 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 		SendMessageW(hQuality, CB_SETCURSEL, g_qualityIdx, 0);
 		y += S(36);
 
-		hLocal = CreateWindowW(L"BUTTON", L"インスタンス経由で再生 (local=true)",
+		CreateLabel(hWnd, Tr(L"language_label").c_str(), M, y + S(3), S(80));
+		hLang = CreateWindowW(L"COMBOBOX", nullptr,
+			WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
+			M + S(86), y, S(200), S(240), hWnd, (HMENU)IDC_SET_LANGUAGE, nullptr, nullptr);
+		BuildLangChoices();
+		{
+			int sel = 0;
+			for (size_t i = 0; i < g_langChoices.size(); i++)
+			{
+				SendMessageW(hLang, CB_ADDSTRING, 0, (LPARAM)g_langChoices[i].display.c_str());
+				if (g_langChoices[i].code == g_langSetting)
+					sel = (int)i;
+			}
+			SendMessageW(hLang, CB_SETCURSEL, sel, 0);
+		}
+		y += S(36);
+
+		hLocal = CreateWindowW(L"BUTTON", Tr(L"local_chk").c_str(),
 			WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
 			M, y, S(360), S(22), hWnd, (HMENU)IDC_SET_LOCAL, nullptr, nullptr);
 		SendMessageW(hLocal, BM_SETCHECK, g_localProxy ? BST_CHECKED : BST_UNCHECKED, 0);
 		y += S(28);
 
-		hCert = CreateWindowW(L"BUTTON", L"証明書エラーを無視",
+		hCert = CreateWindowW(L"BUTTON", Tr(L"cert_chk").c_str(),
 			WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
 			M, y, S(360), S(22), hWnd, (HMENU)IDC_SET_IGNORECERT, nullptr, nullptr);
 		SendMessageW(hCert, BM_SETCHECK, g_ignoreCert ? BST_CHECKED : BST_UNCHECKED, 0);
 		y += S(38);
 
-		CreateWindowW(L"BUTTON", L"OK",
+		CreateWindowW(L"BUTTON", Tr(L"ok_btn").c_str(),
 			WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
 			M + S(170), y, S(90), S(28), hWnd, (HMENU)IDC_SET_OK, nullptr, nullptr);
-		CreateWindowW(L"BUTTON", L"キャンセル",
+		CreateWindowW(L"BUTTON", Tr(L"cancel_btn").c_str(),
 			WS_CHILD | WS_VISIBLE,
 			M + S(270), y, S(90), S(28), hWnd, (HMENU)IDC_SET_CANCEL, nullptr, nullptr);
 
@@ -1715,6 +2319,16 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 			if (g_qualityIdx < 0 || g_qualityIdx > 3) g_qualityIdx = 0;
 			g_localProxy = SendMessageW(hLocal, BM_GETCHECK, 0, 0) == BST_CHECKED;
 			g_ignoreCert = SendMessageW(hCert, BM_GETCHECK, 0, 0) == BST_CHECKED;
+
+			int langSel = (int)SendMessageW(hLang, CB_GETCURSEL, 0, 0);
+			if (langSel >= 0 && langSel < (int)g_langChoices.size() &&
+				g_langChoices[langSel].code != g_langSetting)
+			{
+				g_langSetting = g_langChoices[langSel].code;
+				ReloadLanguage();
+				ApplyUiTexts();
+			}
+
 			SaveSettings();
 			DestroyWindow(hWnd);
 		}
@@ -1740,14 +2354,30 @@ static void OpenSettings()
 {
 	RECT rc;
 	GetWindowRect(g_hWnd, &rc);
-	int w = S(410), h = S(260);
+	int w = S(410), h = S(300);
 	int x = rc.left + ((rc.right - rc.left) - w) / 2;
 	int y = rc.top + ((rc.bottom - rc.top) - h) / 2;
 
 	EnableWindow(g_hWnd, FALSE);
-	CreateWindowW(L"YTLegacyRTSettings", L"設定",
+	CreateWindowW(L"YTLegacyRTSettings", Tr(L"settings_title").c_str(),
 		WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
 		x, y, w, h, g_hWnd, nullptr, nullptr, nullptr);
+}
+
+// 言語変更をメインウィンドウの各コントロールへ反映する
+static void ApplyUiTexts()
+{
+	SetWindowTextW(g_hSearchBtn, Tr(L"search_btn").c_str());
+	SetWindowTextW(g_hSettingsBtn, Tr(L"settings_btn").c_str());
+	SetWindowTextW(g_hSubsBtn, Tr(L"subs_btn").c_str());
+	SetWindowTextW(g_hBackBtn, Tr(L"back_btn").c_str());
+	SetWindowTextW(g_hPlayPauseBtn, Tr(g_isPaused ? L"play_btn" : L"pause_btn").c_str());
+	SetWindowTextW(g_hFullscreenBtn, Tr(g_fullscreen ? L"fullscreen_exit" : L"fullscreen").c_str());
+	if (!g_playerMode)
+		SetStatus(Tr(L"ready"));
+	// ラベル長が変わるのでボタン幅を再計算
+	Layout(g_hWnd);
+	RefreshAll();
 }
 
 // ---------------------------------------------------------------------------
@@ -1767,7 +2397,7 @@ static void ToggleFullscreen()
 			// SetWindowPos中に同期的にWM_SIZE→Layout()が走るため、
 			// フラグとボタン表記は必ず先に更新しておく
 			g_fullscreen = true;
-			SetWindowTextW(g_hFullscreenBtn, L"全画面解除");
+			SetWindowTextW(g_hFullscreenBtn, Tr(L"fullscreen_exit").c_str());
 			SetWindowLongPtrW(g_hWnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
 			SetWindowPos(g_hWnd, HWND_TOP,
 				mi.rcMonitor.left, mi.rcMonitor.top,
@@ -1779,7 +2409,7 @@ static void ToggleFullscreen()
 	else
 	{
 		g_fullscreen = false;
-		SetWindowTextW(g_hFullscreenBtn, L"全画面");
+		SetWindowTextW(g_hFullscreenBtn, Tr(L"fullscreen").c_str());
 		SetWindowLongPtrW(g_hWnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
 		SetWindowPlacement(g_hWnd, &g_wpPrev);
 		SetWindowPos(g_hWnd, nullptr, 0, 0, 0, 0,
@@ -1874,6 +2504,7 @@ static void DrawListItem(DRAWITEMSTRUCT* dis)
 
 	int pad = S(5);
 	int idx = (int)dis->itemID;
+	bool channelMode = (g_listMode == 1 && dis->CtlID == IDC_LIST);
 
 	std::wstring title, author;
 	long long len = -1;
@@ -1886,6 +2517,19 @@ static void DrawListItem(DRAWITEMSTRUCT* dis)
 		author = items[idx].author;
 		len = items[idx].lengthSeconds;
 		thumb = items[idx].thumb;
+	}
+
+	// チャンネル一覧モードはチャンネル名のみのシンプルなカード
+	if (channelMode)
+	{
+		LeaveCriticalSection(&g_cs);
+		RECT trc = { card.left + S(12), card.top, card.right - S(8), card.bottom };
+		SetBkMode(dc, TRANSPARENT);
+		SetTextColor(dc, RGB(20, 20, 20));
+		SelectObject(dc, g_hFontTitle);
+		DrawTextW(dc, title.c_str(), -1, &trc,
+			DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+		return;
 	}
 
 	// サムネイル
@@ -1947,6 +2591,19 @@ static void DrawListItem(DRAWITEMSTRUCT* dis)
 // ---------------------------------------------------------------------------
 // UIレイアウト
 // ---------------------------------------------------------------------------
+// ラベルの実測幅からボタン幅を決める (言語によって文字数が大きく変わるため)
+static int ButtonWidth(const std::wstring& text, int minW)
+{
+	HDC dc = GetDC(g_hWnd);
+	HGDIOBJ old = SelectObject(dc, g_hFontUI);
+	SIZE sz = {};
+	GetTextExtentPoint32W(dc, text.c_str(), (int)text.size(), &sz);
+	SelectObject(dc, old);
+	ReleaseDC(g_hWnd, dc);
+	int wid = sz.cx + S(20);
+	return wid > minW ? wid : minW;
+}
+
 static void Layout(HWND hWnd)
 {
 	RECT rc;
@@ -1962,6 +2619,7 @@ static void Layout(HWND hWnd)
 	ShowWindow(g_hSearchEdit, listVis);
 	ShowWindow(g_hSearchBtn, listVis);
 	ShowWindow(g_hSettingsBtn, listVis);
+	ShowWindow(g_hSubsBtn, listVis);
 	ShowWindow(g_hList, listVis);
 	ShowWindow(g_hBackBtn, playerVis);
 	ShowWindow(g_hPlayerTitle, playerVis);
@@ -1972,42 +2630,91 @@ static void Layout(HWND hWnd)
 	ShowWindow(g_hFullscreenBtn, playerVis);
 	ShowWindow(g_hRecList, g_playerMode && !g_fullscreen ? SW_SHOW : SW_HIDE);
 	ShowWindow(g_hStatsLabel, g_playerMode && !g_fullscreen ? SW_SHOW : SW_HIDE);
+	ShowWindow(g_hChanIcon, g_playerMode && !g_fullscreen ? SW_SHOW : SW_HIDE);
+	ShowWindow(g_hChanName, g_playerMode && !g_fullscreen ? SW_SHOW : SW_HIDE);
+	ShowWindow(g_hSubBtn, g_playerMode && !g_fullscreen ? SW_SHOW : SW_HIDE);
+
+	// ミニプレイヤー (一覧画面で再生セッションが残っている間だけ表示)
+	bool miniVisible = !g_playerMode && g_pSession != nullptr;
+	ShowWindow(g_hMiniThumb, miniVisible ? SW_SHOW : SW_HIDE);
+	ShowWindow(g_hMiniTitle, miniVisible ? SW_SHOW : SW_HIDE);
+	ShowWindow(g_hMiniClose, miniVisible ? SW_SHOW : SW_HIDE);
 
 	if (!g_playerMode)
 	{
-		// 上段: 検索ボックス + 検索 + 設定
+		// 上段: 検索ボックス + 検索 + 登録チャンネル + 設定
 		int topH = S(32);
-		int btnW = S(44);
-		MoveWindow(g_hSearchEdit, M, M, w - M * 2 - btnW * 2 - S(12), topH, TRUE);
-		MoveWindow(g_hSearchBtn, w - M - btnW * 2 - S(6), M, btnW, topH, TRUE);
-		MoveWindow(g_hSettingsBtn, w - M - btnW, M, btnW, topH, TRUE);
+		int searchW = ButtonWidth(Tr(L"search_btn"), S(44));
+		int subsW = ButtonWidth(Tr(L"subs_btn"), S(44));
+		int settingsW = ButtonWidth(Tr(L"settings_btn"), S(44));
+		MoveWindow(g_hSearchEdit, M, M,
+			w - M * 2 - searchW - subsW - settingsW - S(18), topH, TRUE);
+		MoveWindow(g_hSearchBtn, w - M - settingsW - S(6) - subsW - S(6) - searchW, M, searchW, topH, TRUE);
+		MoveWindow(g_hSubsBtn, w - M - settingsW - S(6) - subsW, M, subsW, topH, TRUE);
+		MoveWindow(g_hSettingsBtn, w - M - settingsW, M, settingsW, topH, TRUE);
 
-		// リスト
+		// リスト (ミニプレイヤー表示中はその分だけ短くする)
 		int y = M + topH + S(6);
-		MoveWindow(g_hList, M, y, w - M * 2, h - y - statusH - M, TRUE);
+		int listBottom = h - statusH - M;
+		if (miniVisible)
+		{
+			int miniH = S(44);
+			int miniY = h - statusH - miniH - S(2);
+			int thumbW = S(72);
+			int closeW = S(28);
+			int barW = w - M * 2;
+			if (barW > S(420)) barW = S(420);   // 左下にコンパクトに置く
+			MoveWindow(g_hMiniThumb, M, miniY + S(2), thumbW, S(40), TRUE);
+			MoveWindow(g_hMiniClose, M + barW - closeW, miniY + S(8), closeW, S(28), TRUE);
+			MoveWindow(g_hMiniTitle, M + thumbW + S(6), miniY + S(12),
+				barW - thumbW - closeW - S(14), S(20), TRUE);
+			listBottom = miniY - S(4);
+		}
+		MoveWindow(g_hList, M, y, w - M * 2, listBottom - y, TRUE);
 	}
 	else
 	{
 		// 上段: 戻るボタン
 		int topH = S(32);
-		MoveWindow(g_hBackBtn, M, M, S(70), topH, TRUE);
+		int backW = ButtonWidth(Tr(L"back_btn"), S(70));
+		MoveWindow(g_hBackBtn, M, M, backW, topH, TRUE);
 
-		// 右列: おすすめ動画 (フルスクリーン中は非表示で映像を広く使う)
+		// 右列: チャンネルバー + おすすめ動画 (フルスクリーン中は非表示で映像を広く使う)
 		int recW = g_fullscreen ? 0 : S(300);
 		int y = M + topH + S(6);
 		if (recW > w / 2) recW = w / 2;
 		if (recW > 0)
-			MoveWindow(g_hRecList, w - M - recW, y, recW, h - y - statusH - S(4), TRUE);
+		{
+			int rx = w - M - recW;
+			int chH = S(40);
+			int iconSz = S(36);
+			int subW = ButtonWidth(Tr(L"subscribe_btn"), S(70));
+			int subW2 = ButtonWidth(Tr(L"subscribed_btn"), S(70));
+			if (subW2 > subW) subW = subW2;
+
+			MoveWindow(g_hChanIcon, rx, y, iconSz, iconSz, TRUE);
+			MoveWindow(g_hChanName, rx + iconSz + S(6), y + S(9),
+				recW - iconSz - subW - S(14), S(20), TRUE);
+			MoveWindow(g_hSubBtn, rx + recW - subW, y + S(3), subW, S(30), TRUE);
+
+			MoveWindow(g_hRecList, rx, y + chH + S(4), recW,
+				h - y - chH - S(4) - statusH - S(4), TRUE);
+		}
 
 		// 左列の幅
 		int lw = w - M * 2 - (recW > 0 ? recW + S(8) : 0);
 
 		// 下段: 再生/一時停止 + シークバー + 時間 + 全画面 (左列の幅に収める)
+		// ボタン幅は両状態のラベルの長い方に合わせ、切り替えで幅が変わらないようにする
 		int ctrlH = S(32);
 		int ctrlY = h - statusH - ctrlH - S(4);
-		int btnW = S(80);
+		int btnW = ButtonWidth(Tr(L"pause_btn"), S(80));
+		int playW = ButtonWidth(Tr(L"play_btn"), S(80));
+		if (playW > btnW) btnW = playW;
 		int timeW = S(110);
-		int fsW = S(80);
+		int fsW = ButtonWidth(Tr(L"fullscreen"), S(80));
+		int fsExitW = ButtonWidth(Tr(L"fullscreen_exit"), S(80));
+		if (fsExitW > fsW) fsW = fsExitW;
 		int cr = M + lw;   // 左列右端
 		MoveWindow(g_hPlayPauseBtn, M, ctrlY, btnW, ctrlH, TRUE);
 		MoveWindow(g_hSeekBar, M + btnW + S(8), ctrlY, lw - btnW - timeW - fsW - S(24), ctrlH, TRUE);
@@ -2051,11 +2758,60 @@ static void FillResultList()
 
 	if (status.empty())
 	{
-		wchar_t buf[64];
-		wsprintfW(buf, L"%d件の動画が見つかりました", count);
+		wchar_t buf[128];
+		swprintf_s(buf, Tr(L"results_found").c_str(), count);
 		status = buf;
 	}
 	SetStatus(status);
+}
+
+// 登録チャンネルの一覧をホームのリストに表示する
+static void ShowSubscriptions()
+{
+	EnsureSubsFileUnicode();
+	std::vector<wchar_t> buf(32768, L'\0');
+	GetPrivateProfileSectionW(L"Subscriptions", buf.data(), 32768, GetSubsPath().c_str());
+
+	EnterCriticalSection(&g_cs);
+	InterlockedIncrement(&g_searchGen);   // 進行中の検索/サムネイル取得を無効化
+	ClearResultsLocked();
+	g_searchError.clear();
+	const wchar_t* p = buf.data();
+	while (*p)
+	{
+		std::wstring line = p;
+		p += line.size() + 1;
+		size_t eq = line.find(L'=');
+		if (eq != std::wstring::npos && eq > 0)
+		{
+			VideoItem item;
+			item.videoId = line.substr(0, eq);   // チャンネルID
+			item.title = line.substr(eq + 1);    // チャンネル名
+			item.lengthSeconds = -1;
+			item.thumb = nullptr;
+			g_results.push_back(item);
+		}
+	}
+	int count = (int)g_results.size();
+	LeaveCriticalSection(&g_cs);
+
+	g_listMode = 1;
+	SendMessageW(g_hList, LB_SETITEMHEIGHT, 0, S(44));
+	SendMessageW(g_hList, LB_RESETCONTENT, 0, 0);
+	for (int i = 0; i < count; i++)
+		SendMessageW(g_hList, LB_ADDSTRING, 0, (LPARAM)i);
+	InvalidateRect(g_hList, nullptr, TRUE);
+
+	if (count > 0)
+	{
+		wchar_t sbuf[128];
+		swprintf_s(sbuf, Tr(L"channels_found").c_str(), count);
+		SetStatus(sbuf);
+	}
+	else
+	{
+		SetStatus(Tr(L"no_subs"));
+	}
 }
 
 static void StartSearch()
@@ -2064,12 +2820,12 @@ static void StartSearch()
 	std::wstring instanceUrl = TrimTrailingSlash(g_instanceUrl);
 	if (query.empty())
 	{
-		SetStatus(L"検索ワードを入力してください");
+		SetStatus(Tr(L"enter_query"));
 		return;
 	}
 	if (instanceUrl.empty() || instanceUrl == L"http://" || instanceUrl == L"https://")
 	{
-		SetStatus(L"⚙ボタンからインスタンスURLを設定してください");
+		SetStatus(Tr(L"set_instance"));
 		return;
 	}
 
@@ -2083,7 +2839,7 @@ static void StartSearch()
 		c.video = query;
 		pp->urls.push_back(c);
 		EnterPlayerView(query);
-		SetStatus(L"読み込み中...");
+		SetStatus(Tr(L"loading"));
 		CreateThread(nullptr, 0, PlayThread, pp, 0, nullptr);
 		return;
 	}
@@ -2147,13 +2903,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 			0, 0, 0, 0, hWnd, (HMENU)IDC_SEARCH_EDIT, nullptr, nullptr);
 		g_oldEditProc = (WNDPROC)SetWindowLongPtrW(g_hSearchEdit, GWLP_WNDPROC, (LONG_PTR)SearchEditProc);
 
-		g_hSearchBtn = CreateWindowW(L"BUTTON", L"検索",
+		g_hSearchBtn = CreateWindowW(L"BUTTON", Tr(L"search_btn").c_str(),
 			WS_CHILD | WS_VISIBLE,
 			0, 0, 0, 0, hWnd, (HMENU)IDC_SEARCH_BTN, nullptr, nullptr);
 
-		g_hSettingsBtn = CreateWindowW(L"BUTTON", L"設定",
+		g_hSettingsBtn = CreateWindowW(L"BUTTON", Tr(L"settings_btn").c_str(),
 			WS_CHILD | WS_VISIBLE,
 			0, 0, 0, 0, hWnd, (HMENU)IDC_SETTINGS_BTN, nullptr, nullptr);
+
+		g_hSubsBtn = CreateWindowW(L"BUTTON", Tr(L"subs_btn").c_str(),
+			WS_CHILD | WS_VISIBLE,
+			0, 0, 0, 0, hWnd, (HMENU)IDC_SUBS_BTN, nullptr, nullptr);
 
 		g_hList = CreateWindowW(L"LISTBOX", nullptr,
 			WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY |
@@ -2161,11 +2921,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 			0, 0, 0, 0, hWnd, (HMENU)IDC_LIST, nullptr, nullptr);
 		SendMessageW(g_hList, LB_SETITEMHEIGHT, 0, ItemHeight());
 
-		g_hStatus = CreateWindowW(L"STATIC", L"準備完了",
+		g_hStatus = CreateWindowW(L"STATIC", Tr(L"ready").c_str(),
 			WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS,
 			0, 0, 0, 0, hWnd, (HMENU)IDC_STATUS, nullptr, nullptr);
 
-		g_hBackBtn = CreateWindowW(L"BUTTON", L"← 戻る",
+		g_hBackBtn = CreateWindowW(L"BUTTON", Tr(L"back_btn").c_str(),
 			WS_CHILD,
 			0, 0, 0, 0, hWnd, (HMENU)IDC_BACK_BTN, nullptr, nullptr);
 
@@ -2173,7 +2933,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 			WS_CHILD | SS_ENDELLIPSIS,
 			0, 0, 0, 0, hWnd, (HMENU)IDC_PLAYER_TITLE, nullptr, nullptr);
 
-		g_hPlayPauseBtn = CreateWindowW(L"BUTTON", L"一時停止",
+		g_hPlayPauseBtn = CreateWindowW(L"BUTTON", Tr(L"pause_btn").c_str(),
 			WS_CHILD,
 			0, 0, 0, 0, hWnd, (HMENU)IDC_PLAYPAUSE_BTN, nullptr, nullptr);
 
@@ -2186,7 +2946,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 			WS_CHILD | SS_RIGHT,
 			0, 0, 0, 0, hWnd, (HMENU)IDC_TIME_LABEL, nullptr, nullptr);
 
-		g_hFullscreenBtn = CreateWindowW(L"BUTTON", L"全画面",
+		g_hFullscreenBtn = CreateWindowW(L"BUTTON", Tr(L"fullscreen").c_str(),
 			WS_CHILD,
 			0, 0, 0, 0, hWnd, (HMENU)IDC_FULLSCREEN_BTN, nullptr, nullptr);
 
@@ -2199,6 +2959,30 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 		g_hStatsLabel = CreateWindowW(L"STATIC", L"",
 			WS_CHILD | SS_ENDELLIPSIS,
 			0, 0, 0, 0, hWnd, (HMENU)IDC_STATS_LABEL, nullptr, nullptr);
+
+		g_hChanIcon = CreateWindowW(L"STATIC", nullptr,
+			WS_CHILD | SS_BITMAP | SS_CENTERIMAGE | SS_NOTIFY,
+			0, 0, 0, 0, hWnd, (HMENU)IDC_CHAN_ICON, nullptr, nullptr);
+
+		g_hChanName = CreateWindowW(L"STATIC", L"",
+			WS_CHILD | SS_ENDELLIPSIS | SS_NOTIFY,
+			0, 0, 0, 0, hWnd, (HMENU)IDC_CHAN_NAME, nullptr, nullptr);
+
+		g_hSubBtn = CreateWindowW(L"BUTTON", Tr(L"subscribe_btn").c_str(),
+			WS_CHILD,
+			0, 0, 0, 0, hWnd, (HMENU)IDC_SUB_BTN, nullptr, nullptr);
+
+		g_hMiniThumb = CreateWindowW(L"STATIC", nullptr,
+			WS_CHILD | SS_BITMAP | SS_CENTERIMAGE | SS_NOTIFY | WS_BORDER,
+			0, 0, 0, 0, hWnd, (HMENU)IDC_MINI_THUMB, nullptr, nullptr);
+
+		g_hMiniTitle = CreateWindowW(L"STATIC", L"",
+			WS_CHILD | SS_ENDELLIPSIS | SS_NOTIFY,
+			0, 0, 0, 0, hWnd, (HMENU)IDC_MINI_TITLE, nullptr, nullptr);
+
+		g_hMiniClose = CreateWindowW(L"BUTTON", L"\x2715",
+			WS_CHILD,
+			0, 0, 0, 0, hWnd, (HMENU)IDC_MINI_CLOSE, nullptr, nullptr);
 
 		SetTimer(hWnd, TIMER_POSITION, 500, nullptr);
 
@@ -2307,9 +3091,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 			OpenSettings();
 			break;
 
+		case IDC_SUBS_BTN:
+			ShowSubscriptions();
+			break;
+
 		case IDC_BACK_BTN:
 			LeavePlayerView();
-			SetStatus(L"準備完了");
+			SetStatus(Tr(L"ready"));
 			break;
 
 		case IDC_PLAYPAUSE_BTN:
@@ -2326,6 +3114,31 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 				ToggleFullscreen();
 			break;
 
+		case IDC_SUB_BTN:
+			ToggleSubscribe();
+			break;
+
+		case IDC_CHAN_ICON:
+		case IDC_CHAN_NAME:
+			// チャンネル登録ボタン以外の部分 → チャンネルの動画一覧へ
+			if (HIWORD(wp) == STN_CLICKED && g_playerMode)
+				OpenChannelVideos();
+			break;
+
+		case IDC_MINI_THUMB:
+		case IDC_MINI_TITLE:
+			// ミニプレイヤーのクリック → 再生中の動画に戻る
+			if (HIWORD(wp) == STN_CLICKED)
+				ReturnToPlayer();
+			break;
+
+		case IDC_MINI_CLOSE:
+			// 再生を停止してミニプレイヤーを閉じる
+			Cleanup();
+			Layout(hWnd);
+			SetStatus(Tr(L"ready"));
+			break;
+
 		case IDC_LIST:
 			if (HIWORD(wp) == LBN_DBLCLK)
 			{
@@ -2338,7 +3151,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 					title = g_results[sel].title;
 				}
 				LeaveCriticalSection(&g_cs);
-				if (!videoId.empty())
+				if (videoId.empty())
+					break;
+				if (g_listMode == 1)
+					StartChannelVideos(videoId);   // videoId = チャンネルID
+				else
 					PlayVideoId(videoId, title);
 			}
 			break;
@@ -2365,6 +3182,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_APP_SEARCHDONE:
 		if ((LONG)wp == g_searchGen)
 		{
+			// 動画一覧モードに戻す (チャンネル一覧から遷移した場合)
+			if (g_listMode != 0)
+			{
+				g_listMode = 0;
+				SendMessageW(g_hList, LB_SETITEMHEIGHT, 0, ItemHeight());
+			}
 			FillResultList();
 
 			// サムネイル取得開始
@@ -2389,13 +3212,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 		if ((LONG)wp == g_recGen)
 		{
 			int count;
-			std::wstring stats;
+			std::wstring stats, chanId, chanTitle;
 			EnterCriticalSection(&g_cs);
 			count = (int)g_recResults.size();
 			stats = g_watchStats;
+			chanId = g_chanId;
+			chanTitle = g_chanTitle;
 			LeaveCriticalSection(&g_cs);
 
 			SetWindowTextW(g_hStatsLabel, stats.c_str());
+
+			// チャンネルバー更新
+			SetWindowTextW(g_hChanName, chanTitle.c_str());
+			SetWindowTextW(g_hSubBtn,
+				Tr(IsSubscribed(chanId) ? L"subscribed_btn" : L"subscribe_btn").c_str());
+			EnableWindow(g_hSubBtn, !chanId.empty());
 
 			SendMessageW(g_hRecList, LB_RESETCONTENT, 0, 0);
 			for (int i = 0; i < count; i++)
@@ -2421,6 +3252,38 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 		}
 		break;
 
+	case WM_APP_CHANICON:
+	{
+		HBITMAP bmp = (HBITMAP)lp;
+		if ((LONG)wp == g_recGen && bmp)
+		{
+			HBITMAP old = (HBITMAP)SendMessageW(g_hChanIcon, STM_SETIMAGE, IMAGE_BITMAP, (LPARAM)bmp);
+			if (old) DeleteObject(old);
+			g_chanIconBmp = bmp;
+		}
+		else if (bmp)
+		{
+			DeleteObject(bmp);
+		}
+		break;
+	}
+
+	case WM_APP_MINITHUMB:
+	{
+		HBITMAP bmp = (HBITMAP)lp;
+		if ((LONG)wp == g_recGen && bmp)
+		{
+			HBITMAP old = (HBITMAP)SendMessageW(g_hMiniThumb, STM_SETIMAGE, IMAGE_BITMAP, (LPARAM)bmp);
+			if (old) DeleteObject(old);
+			g_miniThumbBmp = bmp;
+		}
+		else if (bmp)
+		{
+			DeleteObject(bmp);
+		}
+		break;
+	}
+
 	case WM_APP_STATUS:
 	{
 		wchar_t* text = (wchar_t*)lp;
@@ -2429,6 +3292,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 			SetStatus(text);
 			free(text);
 		}
+		// 再生失敗などでセッションが消えた場合にミニプレイヤーの表示を追従させる
+		if (!g_playerMode)
+			Layout(hWnd);
 		break;
 	}
 
@@ -2471,6 +3337,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmd)
 		CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Meiryo UI");
 
 	LoadSettings();
+	ReloadLanguage();
 
 	WNDCLASSW wc = {};
 	wc.lpfnWndProc = WndProc;
