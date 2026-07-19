@@ -1,0 +1,5 @@
+#YT-Legacy-WindowsRT 
+InvidiousAPI経由で動画を取得するWindowsRT向けYoutubeクライアント
+## 使い方
+⓵右上の設定ボタンを押し、InvidiousインスタンスURL にInvidiousAPIが動作するインスタンスのURLを入力する
+②✖で設定ウィンドウを閉じ、検索窓に検索ワードを入力して使用する

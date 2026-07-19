@@ -48,6 +48,8 @@ enum
 	IDC_SEEKBAR,
 	IDC_TIME_LABEL,
 	IDC_FULLSCREEN_BTN,
+	IDC_REC_LIST,
+	IDC_STATS_LABEL,
 
 	// 設定ウィンドウ
 	IDC_SET_INSTANCE = 200,
@@ -61,6 +63,8 @@ enum
 #define WM_APP_SEARCHDONE  (WM_APP + 1)   // wParam: 検索世代
 #define WM_APP_STATUS      (WM_APP + 2)   // lParam: heap確保した wchar_t* (受信側でfree)
 #define WM_APP_THUMB       (WM_APP + 3)   // wParam: アイテムindex lParam: 検索世代
+#define WM_APP_WATCHINFO   (WM_APP + 4)   // wParam: 動画情報世代
+#define WM_APP_RECTHUMB    (WM_APP + 5)   // wParam: アイテムindex lParam: 動画情報世代
 
 HWND g_hWnd;
 HWND g_hSearchEdit;
@@ -75,6 +79,8 @@ HWND g_hPlayPauseBtn;
 HWND g_hSeekBar;
 HWND g_hTimeLabel;
 HWND g_hFullscreenBtn;
+HWND g_hRecList;
+HWND g_hStatsLabel;
 
 HBRUSH g_hbrBlack;
 bool g_fullscreen = false;
@@ -113,9 +119,13 @@ struct VideoItem
 };
 
 CRITICAL_SECTION g_cs;
-std::vector<VideoItem> g_results;      // g_cs で保護
+std::vector<VideoItem> g_results;      // 検索結果 (g_cs で保護)
 std::wstring g_searchError;            // g_cs で保護
 LONG g_searchGen = 0;                  // 検索の世代 (古いスレッドの結果を破棄する)
+
+std::vector<VideoItem> g_recResults;   // おすすめ動画 (g_cs で保護)
+std::wstring g_watchStats;             // 再生数・高評価などの表示文字列 (g_cs で保護)
+LONG g_recGen = 0;                     // 動画情報の世代
 
 WNDPROC g_oldEditProc = nullptr;
 WNDPROC g_oldTrackProc = nullptr;
@@ -123,6 +133,7 @@ WNDPROC g_oldTrackProc = nullptr;
 DWORD WINAPI PlayThread(LPVOID param);
 DWORD WINAPI SearchThread(LPVOID param);
 DWORD WINAPI ThumbThread(LPVOID param);
+DWORD WINAPI WatchThread(LPVOID param);
 static void StartSearch();
 static void ToggleFullscreen();
 
@@ -477,20 +488,24 @@ struct ThumbParams
 {
 	LONG gen;
 	std::wstring instanceUrl;
+	bool rec;   // true = おすすめリスト用
 };
 
-// 検索結果のサムネイルを順次ダウンロードする
+// リストのサムネイルを順次ダウンロードする (検索結果 / おすすめ共用)
 DWORD WINAPI ThumbThread(LPVOID param)
 {
 	ThumbParams* tp = (ThumbParams*)param;
+	std::vector<VideoItem>& items = tp->rec ? g_recResults : g_results;
+	volatile LONG& curGen = tp->rec ? g_recGen : g_searchGen;
+	UINT doneMsg = tp->rec ? WM_APP_RECTHUMB : WM_APP_THUMB;
 
 	for (int i = 0;; i++)
 	{
 		std::wstring videoId;
 		EnterCriticalSection(&g_cs);
-		bool stale = (tp->gen != g_searchGen);
-		if (!stale && i < (int)g_results.size())
-			videoId = g_results[i].videoId;
+		bool stale = (tp->gen != curGen);
+		if (!stale && i < (int)items.size())
+			videoId = items[i].videoId;
 		LeaveCriticalSection(&g_cs);
 
 		if (stale || videoId.empty()) break;
@@ -505,15 +520,15 @@ DWORD WINAPI ThumbThread(LPVOID param)
 
 		bool stored = false;
 		EnterCriticalSection(&g_cs);
-		if (tp->gen == g_searchGen && i < (int)g_results.size() && !g_results[i].thumb)
+		if (tp->gen == curGen && i < (int)items.size() && !items[i].thumb)
 		{
-			g_results[i].thumb = bmp;
+			items[i].thumb = bmp;
 			stored = true;
 		}
 		LeaveCriticalSection(&g_cs);
 
 		if (stored)
-			PostMessageW(g_hWnd, WM_APP_THUMB, (WPARAM)i, (LPARAM)tp->gen);
+			PostMessageW(g_hWnd, doneMsg, (WPARAM)i, (LPARAM)tp->gen);
 		else
 			DeleteObject(bmp);
 	}
@@ -538,6 +553,14 @@ static void ClearResultsLocked()
 	for (size_t i = 0; i < g_results.size(); i++)
 		if (g_results[i].thumb) DeleteObject(g_results[i].thumb);
 	g_results.clear();
+}
+
+// g_cs保持中に呼ぶこと
+static void ClearRecLocked()
+{
+	for (size_t i = 0; i < g_recResults.size(); i++)
+		if (g_recResults[i].thumb) DeleteObject(g_recResults[i].thumb);
+	g_recResults.clear();
 }
 
 DWORD WINAPI SearchThread(LPVOID param)
@@ -589,6 +612,149 @@ DWORD WINAPI SearchThread(LPVOID param)
 
 	PostMessageW(g_hWnd, WM_APP_SEARCHDONE, (WPARAM)sp->gen, 0);
 	delete sp;
+	return 0;
+}
+
+// ---------------------------------------------------------------------------
+// 動画情報 (再生数・高評価・おすすめ) の取得
+// ---------------------------------------------------------------------------
+
+// 12345 → "1.2万" のような略記
+static std::wstring FormatCompact(long long n)
+{
+	wchar_t buf[64];
+	if (n < 0) return std::wstring();
+	if (n >= 100000000)
+	{
+		long long x10 = n * 10 / 100000000;  // 0.1億単位
+		if (x10 % 10)
+			wsprintfW(buf, L"%lld.%lld億", x10 / 10, x10 % 10);
+		else
+			wsprintfW(buf, L"%lld億", x10 / 10);
+	}
+	else if (n >= 10000)
+	{
+		long long x10 = n * 10 / 10000;      // 0.1万単位
+		if (n < 100000 && x10 % 10)
+			wsprintfW(buf, L"%lld.%lld万", x10 / 10, x10 % 10);
+		else
+			wsprintfW(buf, L"%lld万", x10 / 10);
+	}
+	else
+	{
+		wsprintfW(buf, L"%lld", n);
+	}
+	return buf;
+}
+
+// json中の "key":[ ... ] の中身を取り出す (文字列リテラル対応)
+static std::wstring JsonGetArray(const std::wstring& json, const wchar_t* key)
+{
+	std::wstring pat = L"\"";
+	pat += key;
+	pat += L"\"";
+	size_t p = json.find(pat);
+	if (p == std::wstring::npos) return std::wstring();
+	p = json.find(L'[', p + pat.size());
+	if (p == std::wstring::npos) return std::wstring();
+
+	int depth = 0;
+	bool inStr = false;
+	for (size_t i = p; i < json.size(); i++)
+	{
+		wchar_t c = json[i];
+		if (inStr)
+		{
+			if (c == L'\\') i++;
+			else if (c == L'"') inStr = false;
+			continue;
+		}
+		if (c == L'"') { inStr = true; continue; }
+		if (c == L'[') depth++;
+		else if (c == L']')
+		{
+			depth--;
+			if (depth == 0)
+				return json.substr(p, i - p + 1);
+		}
+	}
+	return std::wstring();
+}
+
+struct WatchParams
+{
+	LONG gen;
+	std::wstring instanceUrl;
+	std::wstring videoId;
+};
+
+DWORD WINAPI WatchThread(LPVOID param)
+{
+	WatchParams* wp = (WatchParams*)param;
+
+	std::wstring url = wp->instanceUrl + L"/api/v1/videos/" + wp->videoId;
+	std::string body;
+	std::wstring err;
+	bool ok = HttpGet(url, body, err);
+
+	std::wstring stats;
+	std::vector<VideoItem> recs;
+	if (ok)
+	{
+		std::wstring json = Utf8ToWide(body);
+
+		// おすすめ動画
+		std::wstring recArray = JsonGetArray(json, L"recommendedVideos");
+		std::vector<std::wstring> objs;
+		SplitTopLevelObjects(recArray, objs);
+		for (size_t i = 0; i < objs.size(); i++)
+		{
+			VideoItem item;
+			item.videoId = JsonGetString(objs[i], L"videoId");
+			item.title = JsonGetString(objs[i], L"title");
+			item.author = JsonGetString(objs[i], L"author");
+			long long views = JsonGetNumber(objs[i], L"viewCount");
+			if (views >= 0)
+				item.author += L"・" + FormatCompact(views) + L"回視聴";
+			item.lengthSeconds = JsonGetNumber(objs[i], L"lengthSeconds");
+			item.thumb = nullptr;
+			if (!item.videoId.empty())
+				recs.push_back(item);
+		}
+
+		// 統計 (recommendedVideosより手前のトップレベル部分から取る)
+		size_t recPos = json.find(L"\"recommendedVideos\"");
+		std::wstring top = (recPos != std::wstring::npos) ? json.substr(0, recPos) : json;
+		long long views = JsonGetNumber(top, L"viewCount");
+		long long likes = JsonGetNumber(top, L"likeCount");
+		std::wstring author = JsonGetString(top, L"author");
+		std::wstring published = JsonGetString(top, L"publishedText");
+
+		if (views >= 0)
+			stats += FormatCompact(views) + L"回視聴";
+		if (likes >= 0)
+			stats += (stats.empty() ? L"" : L"　") + std::wstring(L"高評価 ") + FormatCompact(likes);
+		if (!author.empty())
+			stats += (stats.empty() ? L"" : L"　") + author;
+		if (!published.empty())
+			stats += (stats.empty() ? L"" : L"　") + published;
+	}
+
+	EnterCriticalSection(&g_cs);
+	if (wp->gen == g_recGen)
+	{
+		ClearRecLocked();
+		g_recResults.swap(recs);
+		g_watchStats = stats;
+		LeaveCriticalSection(&g_cs);
+		PostMessageW(g_hWnd, WM_APP_WATCHINFO, (WPARAM)wp->gen, 0);
+	}
+	else
+	{
+		LeaveCriticalSection(&g_cs);
+	}
+
+	delete wp;
 	return 0;
 }
 
@@ -938,7 +1104,9 @@ static void EnterPlayerView(const std::wstring& title)
 	SetWindowTextW(g_hPlayerTitle, title.c_str());
 	SetWindowTextW(g_hPlayPauseBtn, L"一時停止");
 	SetWindowTextW(g_hTimeLabel, L"--:-- / --:--");
+	SetWindowTextW(g_hStatsLabel, L"");
 	SendMessageW(g_hSeekBar, TBM_SETPOS, TRUE, 0);
+	SendMessageW(g_hRecList, LB_RESETCONTENT, 0, 0);
 	Layout(g_hWnd);
 	RefreshAll();
 }
@@ -972,6 +1140,13 @@ static void PlayVideoId(const std::wstring& videoId, const std::wstring& title)
 	EnterPlayerView(title);
 	SetStatus(L"読み込み中...");
 	CreateThread(nullptr, 0, PlayThread, new std::wstring(url), 0, nullptr);
+
+	// 再生数・高評価・おすすめ動画をバックグラウンドで取得
+	WatchParams* wpr = new WatchParams;
+	wpr->gen = InterlockedIncrement(&g_recGen);
+	wpr->instanceUrl = instanceUrl;
+	wpr->videoId = videoId;
+	CreateThread(nullptr, 0, WatchThread, wpr, 0, nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,6 +1260,8 @@ static void OpenSettings()
 // ---------------------------------------------------------------------------
 // フルスクリーン切り替え
 // ---------------------------------------------------------------------------
+static void RefreshAll();
+
 static void ToggleFullscreen()
 {
 	DWORD style = (DWORD)GetWindowLongPtrW(g_hWnd, GWL_STYLE);
@@ -1092,27 +1269,34 @@ static void ToggleFullscreen()
 	{
 		MONITORINFO mi = { sizeof(mi) };
 		if (GetWindowPlacement(g_hWnd, &g_wpPrev) &&
-			GetMonitorInfoW(MonitorFromWindow(g_hWnd, MONITOR_DEFAULTTOPRIMARY), &mi))
+			GetMonitorInfoW(MonitorFromWindow(g_hWnd, MONITOR_DEFAULTTONEAREST), &mi))
 		{
+			// SetWindowPos中に同期的にWM_SIZE→Layout()が走るため、
+			// フラグとボタン表記は必ず先に更新しておく
+			g_fullscreen = true;
+			SetWindowTextW(g_hFullscreenBtn, L"全画面解除");
 			SetWindowLongPtrW(g_hWnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
 			SetWindowPos(g_hWnd, HWND_TOP,
 				mi.rcMonitor.left, mi.rcMonitor.top,
 				mi.rcMonitor.right - mi.rcMonitor.left,
 				mi.rcMonitor.bottom - mi.rcMonitor.top,
 				SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-			g_fullscreen = true;
-			SetWindowTextW(g_hFullscreenBtn, L"全画面解除");
 		}
 	}
 	else
 	{
+		g_fullscreen = false;
+		SetWindowTextW(g_hFullscreenBtn, L"全画面");
 		SetWindowLongPtrW(g_hWnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
 		SetWindowPlacement(g_hWnd, &g_wpPrev);
 		SetWindowPos(g_hWnd, nullptr, 0, 0, 0, 0,
 			SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-		g_fullscreen = false;
-		SetWindowTextW(g_hFullscreenBtn, L"全画面");
 	}
+
+	// 最大化⇔ボーダーレスなどサイズが変わらずWM_SIZEが来ないケースに備え、
+	// 切り替え後の状態で必ず再レイアウトする
+	Layout(g_hWnd);
+	RefreshAll();
 }
 
 // ---------------------------------------------------------------------------
@@ -1202,12 +1386,13 @@ static void DrawListItem(DRAWITEMSTRUCT* dis)
 	long long len = -1;
 	HBITMAP thumb = nullptr;
 	EnterCriticalSection(&g_cs);
-	if (idx < (int)g_results.size())
+	std::vector<VideoItem>& items = (dis->CtlID == IDC_REC_LIST) ? g_recResults : g_results;
+	if (idx < (int)items.size())
 	{
-		title = g_results[idx].title;
-		author = g_results[idx].author;
-		len = g_results[idx].lengthSeconds;
-		thumb = g_results[idx].thumb;
+		title = items[idx].title;
+		author = items[idx].author;
+		len = items[idx].lengthSeconds;
+		thumb = items[idx].thumb;
 	}
 
 	// サムネイル
@@ -1292,6 +1477,8 @@ static void Layout(HWND hWnd)
 	ShowWindow(g_hSeekBar, playerVis);
 	ShowWindow(g_hTimeLabel, playerVis);
 	ShowWindow(g_hFullscreenBtn, playerVis);
+	ShowWindow(g_hRecList, g_playerMode && !g_fullscreen ? SW_SHOW : SW_HIDE);
+	ShowWindow(g_hStatsLabel, g_playerMode && !g_fullscreen ? SW_SHOW : SW_HIDE);
 
 	if (!g_playerMode)
 	{
@@ -1308,25 +1495,47 @@ static void Layout(HWND hWnd)
 	}
 	else
 	{
-		// 上段: 戻る + タイトル
+		// 上段: 戻るボタン
 		int topH = S(32);
 		MoveWindow(g_hBackBtn, M, M, S(70), topH, TRUE);
-		MoveWindow(g_hPlayerTitle, M + S(78), M + S(6), w - M * 2 - S(78), topH - S(6), TRUE);
 
-		// 下段: 再生/一時停止 + シークバー + 時間 + 全画面
+		// 右列: おすすめ動画 (フルスクリーン中は非表示で映像を広く使う)
+		int recW = g_fullscreen ? 0 : S(300);
+		int y = M + topH + S(6);
+		if (recW > w / 2) recW = w / 2;
+		if (recW > 0)
+			MoveWindow(g_hRecList, w - M - recW, y, recW, h - y - statusH - S(4), TRUE);
+
+		// 左列の幅
+		int lw = w - M * 2 - (recW > 0 ? recW + S(8) : 0);
+
+		// 下段: 再生/一時停止 + シークバー + 時間 + 全画面 (左列の幅に収める)
 		int ctrlH = S(32);
 		int ctrlY = h - statusH - ctrlH - S(4);
 		int btnW = S(80);
 		int timeW = S(110);
 		int fsW = S(80);
+		int cr = M + lw;   // 左列右端
 		MoveWindow(g_hPlayPauseBtn, M, ctrlY, btnW, ctrlH, TRUE);
-		MoveWindow(g_hSeekBar, M + btnW + S(8), ctrlY, w - M * 2 - btnW - timeW - fsW - S(24), ctrlH, TRUE);
-		MoveWindow(g_hTimeLabel, w - M - fsW - S(8) - timeW, ctrlY + S(8), timeW, ctrlH - S(8), TRUE);
-		MoveWindow(g_hFullscreenBtn, w - M - fsW, ctrlY, fsW, ctrlH, TRUE);
+		MoveWindow(g_hSeekBar, M + btnW + S(8), ctrlY, lw - btnW - timeW - fsW - S(24), ctrlH, TRUE);
+		MoveWindow(g_hTimeLabel, cr - fsW - S(8) - timeW, ctrlY + S(8), timeW, ctrlH - S(8), TRUE);
+		MoveWindow(g_hFullscreenBtn, cr - fsW, ctrlY, fsW, ctrlH, TRUE);
+
+		// タイトル + 統計 (映像の下)
+		int infoH = g_fullscreen ? 0 : S(64);
+		if (infoH > 0)
+		{
+			int infoY = ctrlY - infoH;
+			MoveWindow(g_hPlayerTitle, M, infoY, lw, S(40), TRUE);
+			MoveWindow(g_hStatsLabel, M, infoY + S(44), lw, S(18), TRUE);
+		}
+		else
+		{
+			MoveWindow(g_hPlayerTitle, 0, 0, 0, 0, TRUE);
+		}
 
 		// 映像
-		int y = M + topH + S(6);
-		MoveWindow(g_hVideo, 0, y, w, ctrlY - y - S(4), TRUE);
+		MoveWindow(g_hVideo, M, y, lw, ctrlY - infoH - y - S(4), TRUE);
 	}
 
 	MoveWindow(g_hStatus, M, h - statusH, w - M * 2, statusH, TRUE);
@@ -1482,6 +1691,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 			WS_CHILD,
 			0, 0, 0, 0, hWnd, (HMENU)IDC_FULLSCREEN_BTN, nullptr, nullptr);
 
+		g_hRecList = CreateWindowW(L"LISTBOX", nullptr,
+			WS_CHILD | WS_VSCROLL | LBS_NOTIFY |
+			LBS_OWNERDRAWFIXED | LBS_NOINTEGRALHEIGHT,
+			0, 0, 0, 0, hWnd, (HMENU)IDC_REC_LIST, nullptr, nullptr);
+		SendMessageW(g_hRecList, LB_SETITEMHEIGHT, 0, ItemHeight());
+
+		g_hStatsLabel = CreateWindowW(L"STATIC", L"",
+			WS_CHILD | SS_ENDELLIPSIS,
+			0, 0, 0, 0, hWnd, (HMENU)IDC_STATS_LABEL, nullptr, nullptr);
+
 		SetTimer(hWnd, TIMER_POSITION, 500, nullptr);
 
 		g_hVideo = CreateWindowW(L"STATIC", nullptr,
@@ -1496,6 +1715,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 				child = GetWindow(child, GW_HWNDNEXT);
 			}
 		}
+		SendMessageW(g_hPlayerTitle, WM_SETFONT, (WPARAM)g_hFontTitle, TRUE);
 
 		Layout(hWnd);
 		break;
@@ -1558,7 +1778,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_MEASUREITEM:
 	{
 		MEASUREITEMSTRUCT* mis = (MEASUREITEMSTRUCT*)lp;
-		if (mis->CtlID == IDC_LIST)
+		if (mis->CtlID == IDC_LIST || mis->CtlID == IDC_REC_LIST)
 		{
 			mis->itemHeight = ItemHeight();
 			return TRUE;
@@ -1569,7 +1789,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_DRAWITEM:
 	{
 		DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lp;
-		if (dis->CtlID == IDC_LIST)
+		if (dis->CtlID == IDC_LIST || dis->CtlID == IDC_REC_LIST)
 		{
 			DrawListItem(dis);
 			return TRUE;
@@ -1623,6 +1843,23 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 					PlayVideoId(videoId, title);
 			}
 			break;
+
+		case IDC_REC_LIST:
+			if (HIWORD(wp) == LBN_DBLCLK)
+			{
+				int sel = (int)SendMessageW(g_hRecList, LB_GETCURSEL, 0, 0);
+				std::wstring videoId, title;
+				EnterCriticalSection(&g_cs);
+				if (sel >= 0 && sel < (int)g_recResults.size())
+				{
+					videoId = g_recResults[sel].videoId;
+					title = g_recResults[sel].title;
+				}
+				LeaveCriticalSection(&g_cs);
+				if (!videoId.empty())
+					PlayVideoId(videoId, title);
+			}
+			break;
 		}
 		break;
 
@@ -1635,6 +1872,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 			ThumbParams* tp = new ThumbParams;
 			tp->gen = (LONG)wp;
 			tp->instanceUrl = TrimTrailingSlash(g_instanceUrl);
+			tp->rec = false;
 			CreateThread(nullptr, 0, ThumbThread, tp, 0, nullptr);
 		}
 		break;
@@ -1645,6 +1883,42 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 			RECT rc;
 			if (SendMessageW(g_hList, LB_GETITEMRECT, wp, (LPARAM)&rc) != LB_ERR)
 				InvalidateRect(g_hList, &rc, TRUE);
+		}
+		break;
+
+	case WM_APP_WATCHINFO:
+		if ((LONG)wp == g_recGen)
+		{
+			int count;
+			std::wstring stats;
+			EnterCriticalSection(&g_cs);
+			count = (int)g_recResults.size();
+			stats = g_watchStats;
+			LeaveCriticalSection(&g_cs);
+
+			SetWindowTextW(g_hStatsLabel, stats.c_str());
+
+			SendMessageW(g_hRecList, LB_RESETCONTENT, 0, 0);
+			for (int i = 0; i < count; i++)
+				SendMessageW(g_hRecList, LB_ADDSTRING, 0, (LPARAM)i);
+
+			if (count > 0)
+			{
+				ThumbParams* tp = new ThumbParams;
+				tp->gen = (LONG)wp;
+				tp->instanceUrl = TrimTrailingSlash(g_instanceUrl);
+				tp->rec = true;
+				CreateThread(nullptr, 0, ThumbThread, tp, 0, nullptr);
+			}
+		}
+		break;
+
+	case WM_APP_RECTHUMB:
+		if ((LONG)lp == g_recGen)
+		{
+			RECT rc;
+			if (SendMessageW(g_hRecList, LB_GETITEMRECT, wp, (LPARAM)&rc) != LB_ERR)
+				InvalidateRect(g_hRecList, &rc, TRUE);
 		}
 		break;
 
