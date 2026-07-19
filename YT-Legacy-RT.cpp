@@ -12,6 +12,7 @@
 #include <gdiplus.h>
 #include <commctrl.h>
 #include <windowsx.h>
+#include <stdio.h>
 #include <string>
 #include <vector>
 
@@ -337,6 +338,88 @@ static bool HttpGet(const std::wstring& url, std::string& out, std::wstring& err
 	return ok;
 }
 
+// ストリームURLを事前検証し、リダイレクト解決済みの最終URLを得る。
+// 古いMedia Foundationは相対パスのLocationヘッダを追えないことがあるため、
+// WinHTTPで解決した絶対URLをMFに渡す。失敗時はstatusにHTTPコードが入る (0=接続不可)。
+static bool ProbeStreamUrl(const std::wstring& url, std::wstring& finalUrl, DWORD& status)
+{
+	finalUrl = url;
+	status = 0;
+
+	URL_COMPONENTS uc = {};
+	uc.dwStructSize = sizeof(uc);
+	wchar_t host[256] = {};
+	wchar_t path[2048] = {};
+	uc.lpszHostName = host;
+	uc.dwHostNameLength = 256;
+	uc.lpszUrlPath = path;
+	uc.dwUrlPathLength = 2048;
+
+	if (!WinHttpCrackUrl(url.c_str(), (DWORD)url.size(), 0, &uc))
+		return false;
+	bool https = (uc.nScheme == INTERNET_SCHEME_HTTPS);
+
+	HINTERNET hOpen = WinHttpOpen(
+		L"Mozilla/5.0 (Windows NT 6.3; ARM) YT-Legacy-RT/1.0",
+		WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+		WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+	if (!hOpen) return false;
+
+	// フォールバックを速くするため短めのタイムアウト
+	WinHttpSetTimeouts(hOpen, 10000, 10000, 30000, 30000);
+
+	DWORD protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1 |
+	                  WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1 |
+	                  WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+	WinHttpSetOption(hOpen, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
+
+	bool ok = false;
+	HINTERNET hConnect = WinHttpConnect(hOpen, host, uc.nPort, 0);
+	HINTERNET hRequest = nullptr;
+	if (hConnect)
+	{
+		hRequest = WinHttpOpenRequest(hConnect, L"GET", path,
+			nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+			https ? WINHTTP_FLAG_SECURE : 0);
+	}
+	if (hRequest)
+	{
+		if (g_ignoreCert)
+		{
+			DWORD flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+			              SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+			              SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+			              SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+			WinHttpSetOption(hRequest, WINHTTP_OPTION_SECURITY_FLAGS, &flags, sizeof(flags));
+		}
+
+		if (WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+			WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+			WinHttpReceiveResponse(hRequest, nullptr))
+		{
+			DWORD size = sizeof(status);
+			WinHttpQueryHeaders(hRequest,
+				WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+				WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX);
+
+			if (status == 200 || status == 206)
+			{
+				// リダイレクト解決後の最終URL
+				wchar_t urlBuf[4096];
+				DWORD urlLen = sizeof(urlBuf);
+				if (WinHttpQueryOption(hRequest, WINHTTP_OPTION_URL, urlBuf, &urlLen))
+					finalUrl = urlBuf;
+				ok = true;
+			}
+		}
+	}
+
+	if (hRequest) WinHttpCloseHandle(hRequest);
+	if (hConnect) WinHttpCloseHandle(hConnect);
+	WinHttpCloseHandle(hOpen);
+	return ok;
+}
+
 // ---------------------------------------------------------------------------
 // 最小限のJSONパース (Invidiousの検索結果用)
 // ---------------------------------------------------------------------------
@@ -624,25 +707,26 @@ static std::wstring FormatCompact(long long n)
 {
 	wchar_t buf[64];
 	if (n < 0) return std::wstring();
+	// 注意: wsprintfW は %lld 非対応のため swprintf_s を使うこと
 	if (n >= 100000000)
 	{
 		long long x10 = n * 10 / 100000000;  // 0.1億単位
 		if (x10 % 10)
-			wsprintfW(buf, L"%lld.%lld億", x10 / 10, x10 % 10);
+			swprintf_s(buf, L"%lld.%lld億", x10 / 10, x10 % 10);
 		else
-			wsprintfW(buf, L"%lld億", x10 / 10);
+			swprintf_s(buf, L"%lld億", x10 / 10);
 	}
 	else if (n >= 10000)
 	{
 		long long x10 = n * 10 / 10000;      // 0.1万単位
 		if (n < 100000 && x10 % 10)
-			wsprintfW(buf, L"%lld.%lld万", x10 / 10, x10 % 10);
+			swprintf_s(buf, L"%lld.%lld万", x10 / 10, x10 % 10);
 		else
-			wsprintfW(buf, L"%lld万", x10 / 10);
+			swprintf_s(buf, L"%lld万", x10 / 10);
 	}
 	else
 	{
-		wsprintfW(buf, L"%lld", n);
+		swprintf_s(buf, L"%lld", n);
 	}
 	return buf;
 }
@@ -907,33 +991,19 @@ HRESULT CreateTopology()
 	return hr;
 }
 
-void Play(const wchar_t* url)
+HRESULT Play(const wchar_t* url)
 {
 	HRESULT hr;
-	if (FAILED(hr = CreateSession()))
-	{
-		PostStatus(L"再生失敗: セッション作成エラー");
-		return;
-	}
-	if (FAILED(hr = CreateMediaSource(url)))
-	{
-		wchar_t buf[128];
-		wsprintfW(buf, L"再生失敗: ソースを開けません (hr=0x%08X)", hr);
-		PostStatus(buf);
-		return;
-	}
-	if (FAILED(hr = CreateTopology()))
-	{
-		wchar_t buf[128];
-		wsprintfW(buf, L"再生失敗: トポロジ構築エラー (hr=0x%08X)", hr);
-		PostStatus(buf);
-		return;
-	}
+	if (FAILED(hr = CreateSession())) return hr;
+	if (FAILED(hr = CreateMediaSource(url))) return hr;
+	if (FAILED(hr = CreateTopology())) return hr;
 
 	PROPVARIANT var;
 	PropVariantInit(&var);
-	g_pSession->Start(&GUID_NULL, &var);
-	PostStatus(L"再生中");
+	hr = g_pSession->Start(&GUID_NULL, &var);
+	if (SUCCEEDED(hr))
+		PostStatus(L"再生中");
+	return hr;
 }
 
 // 現在の再生位置を秒で返す (-1 = 取得不可)
@@ -1022,23 +1092,73 @@ void ToFileUrl(const wchar_t* path, wchar_t* out, size_t outSize)
 	wsprintfW(out, L"file:///%c:%s", path[0], path + 2);
 }
 
+// 候補URLを前から順に試す (プロキシ経由が403でも直接リンクで再生できる場合がある)
+struct PlayParams
+{
+	std::vector<std::wstring> urls;
+};
+
 DWORD WINAPI PlayThread(LPVOID param)
 {
-	std::wstring* input = (std::wstring*)param;
+	PlayParams* pp = (PlayParams*)param;
+	bool played = false;
+	std::wstring lastErr;
 
-	wchar_t finalUrl[2048] = {};
-
-	if (IsLocalPath(input->c_str()))
+	for (size_t i = 0; i < pp->urls.size(); i++)
 	{
-		ToFileUrl(input->c_str(), finalUrl, 2048);
-	}
-	else
-	{
-		lstrcpynW(finalUrl, input->c_str(), 2048);
+		if (pp->urls.size() > 1)
+		{
+			wchar_t buf[64];
+			swprintf_s(buf, L"読み込み中... (%d/%d)", (int)i + 1, (int)pp->urls.size());
+			PostStatus(buf);
+		}
+
+		const std::wstring& u = pp->urls[i];
+
+		if (IsLocalPath(u.c_str()))
+		{
+			wchar_t fileUrl[2048] = {};
+			ToFileUrl(u.c_str(), fileUrl, 2048);
+			HRESULT hr = Play(fileUrl);
+			if (SUCCEEDED(hr)) { played = true; break; }
+			wchar_t buf[64];
+			swprintf_s(buf, L"hr=0x%08X", (unsigned)hr);
+			lastErr = buf;
+			continue;
+		}
+
+		// 事前にWinHTTPで検証し、リダイレクト解決済みURLをMFに渡す
+		std::wstring resolved;
+		DWORD status = 0;
+		if (!ProbeStreamUrl(u, resolved, status))
+		{
+			wchar_t buf[64];
+			if (status != 0)
+				swprintf_s(buf, L"HTTP %u", status);
+			else
+				swprintf_s(buf, L"接続不可");
+			lastErr = buf;
+			continue;
+		}
+
+		HRESULT hr = Play(resolved.c_str());
+		if (SUCCEEDED(hr)) { played = true; break; }
+
+		wchar_t buf[64];
+		swprintf_s(buf, L"hr=0x%08X", (unsigned)hr);
+		lastErr = buf;
 	}
 
-	delete input;
-	Play(finalUrl);
+	if (!played)
+	{
+		Cleanup();
+		std::wstring msg = L"再生失敗: " + lastErr;
+		if (lastErr.find(L"HTTP 4") == 0 || lastErr.find(L"HTTP 5") == 0)
+			msg += L" (インスタンス側でこの動画を取得できていません)";
+		PostStatus(msg);
+	}
+
+	delete pp;
 	return 0;
 }
 
@@ -1131,15 +1251,21 @@ static void PlayVideoId(const std::wstring& videoId, const std::wstring& title)
 	}
 
 	// 画質: itag 18 = 360p / itag 22 = 720p (どちらもH.264+AACのmuxed MP4)
-	const wchar_t* itag = (g_qualityIdx == 1) ? L"22" : L"18";
-
-	std::wstring url = instanceUrl + L"/latest_version?id=" + videoId + L"&itag=" + itag;
-	if (g_localProxy)
-		url += L"&local=true";
+	// プロキシ経由(local=true)が403になる動画があるため、直接リンクや360pへ
+	// 順にフォールバックする
+	std::wstring base = instanceUrl + L"/latest_version?id=" + videoId + L"&itag=";
+	PlayParams* pp = new PlayParams;
+	if (g_qualityIdx == 1)
+	{
+		if (g_localProxy) pp->urls.push_back(base + L"22&local=true");
+		pp->urls.push_back(base + L"22");
+	}
+	if (g_localProxy) pp->urls.push_back(base + L"18&local=true");
+	pp->urls.push_back(base + L"18");
 
 	EnterPlayerView(title);
 	SetStatus(L"読み込み中...");
-	CreateThread(nullptr, 0, PlayThread, new std::wstring(url), 0, nullptr);
+	CreateThread(nullptr, 0, PlayThread, pp, 0, nullptr);
 
 	// 再生数・高評価・おすすめ動画をバックグラウンドで取得
 	WatchParams* wpr = new WatchParams;
@@ -1419,9 +1545,9 @@ static void DrawListItem(DRAWITEMSTRUCT* dis)
 	{
 		wchar_t badge[32];
 		if (len >= 3600)
-			wsprintfW(badge, L"%lld:%02lld:%02lld", len / 3600, (len / 60) % 60, len % 60);
+			swprintf_s(badge, L"%lld:%02lld:%02lld", len / 3600, (len / 60) % 60, len % 60);
 		else
-			wsprintfW(badge, L"%lld:%02lld", len / 60, len % 60);
+			swprintf_s(badge, L"%lld:%02lld", len / 60, len % 60);
 
 		SelectObject(dc, g_hFontSmall);
 		SIZE sz;
@@ -1583,9 +1709,11 @@ static void StartSearch()
 	// URLやローカルパスを直接入力した場合はそのまま再生
 	if (query.find(L"http://") == 0 || query.find(L"https://") == 0 || IsLocalPath(query.c_str()))
 	{
+		PlayParams* pp = new PlayParams;
+		pp->urls.push_back(query);
 		EnterPlayerView(query);
 		SetStatus(L"読み込み中...");
-		CreateThread(nullptr, 0, PlayThread, new std::wstring(query), 0, nullptr);
+		CreateThread(nullptr, 0, PlayThread, pp, 0, nullptr);
 		return;
 	}
 
