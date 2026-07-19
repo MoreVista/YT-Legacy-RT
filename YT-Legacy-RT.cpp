@@ -101,7 +101,7 @@ bool g_localProxy = true;
 bool g_ignoreCert = false;
 
 IMFMediaSession* g_pSession = nullptr;
-IMFMediaSource*  g_pSource = nullptr;
+IMFMediaSource*  g_pSource = nullptr;   // muxed単体、またはDASH時は映像+音声の合成ソース
 
 volatile LONGLONG g_duration100ns = 0;  // 動画の長さ (100ns単位、0=不明)
 bool g_isPaused = false;
@@ -126,6 +126,7 @@ LONG g_searchGen = 0;                  // 検索の世代 (古いスレッドの
 
 std::vector<VideoItem> g_recResults;   // おすすめ動画 (g_cs で保護)
 std::wstring g_watchStats;             // 再生数・高評価などの表示文字列 (g_cs で保護)
+std::wstring g_nowPlaying;             // 「再生中 (720p DASH)」等 (g_cs で保護)
 LONG g_recGen = 0;                     // 動画情報の世代
 
 WNDPROC g_oldEditProc = nullptr;
@@ -346,14 +347,15 @@ static bool ProbeStreamUrl(const std::wstring& url, std::wstring& finalUrl, DWOR
 	finalUrl = url;
 	status = 0;
 
+	// googlevideoのDASH URLは2000文字を超えるため大きめに取る
 	URL_COMPONENTS uc = {};
 	uc.dwStructSize = sizeof(uc);
-	wchar_t host[256] = {};
-	wchar_t path[2048] = {};
+	wchar_t host[512] = {};
+	std::vector<wchar_t> path(8192, L'\0');
 	uc.lpszHostName = host;
-	uc.dwHostNameLength = 256;
-	uc.lpszUrlPath = path;
-	uc.dwUrlPathLength = 2048;
+	uc.dwHostNameLength = 512;
+	uc.lpszUrlPath = path.data();
+	uc.dwUrlPathLength = 8192;
 
 	if (!WinHttpCrackUrl(url.c_str(), (DWORD)url.size(), 0, &uc))
 		return false;
@@ -378,7 +380,7 @@ static bool ProbeStreamUrl(const std::wstring& url, std::wstring& finalUrl, DWOR
 	HINTERNET hRequest = nullptr;
 	if (hConnect)
 	{
-		hRequest = WinHttpOpenRequest(hConnect, L"GET", path,
+		hRequest = WinHttpOpenRequest(hConnect, L"GET", path.data(),
 			nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
 			https ? WINHTTP_FLAG_SECURE : 0);
 	}
@@ -405,10 +407,10 @@ static bool ProbeStreamUrl(const std::wstring& url, std::wstring& finalUrl, DWOR
 			if (status == 200 || status == 206)
 			{
 				// リダイレクト解決後の最終URL
-				wchar_t urlBuf[4096];
-				DWORD urlLen = sizeof(urlBuf);
-				if (WinHttpQueryOption(hRequest, WINHTTP_OPTION_URL, urlBuf, &urlLen))
-					finalUrl = urlBuf;
+				std::vector<wchar_t> urlBuf(8192, L'\0');
+				DWORD urlLen = (DWORD)(urlBuf.size() * sizeof(wchar_t));
+				if (WinHttpQueryOption(hRequest, WINHTTP_OPTION_URL, urlBuf.data(), &urlLen))
+					finalUrl = urlBuf.data();
 				ok = true;
 			}
 		}
@@ -845,6 +847,80 @@ DWORD WINAPI WatchThread(LPVOID param)
 // ---------------------------------------------------------------------------
 // Media Foundation 再生コア
 // ---------------------------------------------------------------------------
+volatile LONG g_sessionErrorHr = 0;   // セッションの非同期エラー (0=なし)
+
+// セッションイベントを監視して非同期エラーを捕捉する
+class SessionCallback : public IMFAsyncCallback
+{
+	LONG m_ref;
+	IMFMediaSession* m_session;
+
+	~SessionCallback()
+	{
+		if (m_session) m_session->Release();
+	}
+
+public:
+	SessionCallback(IMFMediaSession* s) : m_ref(1), m_session(s)
+	{
+		m_session->AddRef();
+	}
+
+	STDMETHODIMP QueryInterface(REFIID riid, void** ppv)
+	{
+		if (riid == __uuidof(IUnknown) || riid == __uuidof(IMFAsyncCallback))
+		{
+			*ppv = static_cast<IMFAsyncCallback*>(this);
+			AddRef();
+			return S_OK;
+		}
+		*ppv = nullptr;
+		return E_NOINTERFACE;
+	}
+	STDMETHODIMP_(ULONG) AddRef() { return InterlockedIncrement(&m_ref); }
+	STDMETHODIMP_(ULONG) Release()
+	{
+		LONG r = InterlockedDecrement(&m_ref);
+		if (r == 0) delete this;
+		return r;
+	}
+	STDMETHODIMP GetParameters(DWORD*, DWORD*) { return E_NOTIMPL; }
+
+	STDMETHODIMP Invoke(IMFAsyncResult* result)
+	{
+		IMFMediaEvent* ev = nullptr;
+		if (FAILED(m_session->EndGetEvent(result, &ev)))
+		{
+			// セッションは既にシャットダウン済み → 監視終了
+			m_session->Release();
+			m_session = nullptr;
+			Release();
+			return S_OK;
+		}
+
+		MediaEventType met = MEUnknown;
+		ev->GetType(&met);
+		HRESULT status = S_OK;
+		ev->GetStatus(&status);
+
+		if (FAILED(status))
+			InterlockedExchange(&g_sessionErrorHr, (LONG)status);
+
+		if (met == MESessionEnded)
+			PostStatus(L"再生終了");
+
+		ev->Release();
+
+		if (met == MESessionClosed || FAILED(m_session->BeginGetEvent(this, nullptr)))
+		{
+			m_session->Release();
+			m_session = nullptr;
+			Release();
+		}
+		return S_OK;
+	}
+};
+
 void Cleanup()
 {
 	if (g_pSession)
@@ -856,6 +932,7 @@ void Cleanup()
 	}
 	if (g_pSource)
 	{
+		// 合成ソースの場合はShutdownで内包する映像/音声ソースも停止する
 		g_pSource->Shutdown();
 		g_pSource->Release();
 		g_pSource = nullptr;
@@ -866,10 +943,18 @@ void Cleanup()
 HRESULT CreateSession()
 {
 	Cleanup();
-	return MFCreateMediaSession(nullptr, &g_pSession);
+	InterlockedExchange(&g_sessionErrorHr, 0);
+	HRESULT hr = MFCreateMediaSession(nullptr, &g_pSession);
+	if (SUCCEEDED(hr))
+	{
+		SessionCallback* cb = new SessionCallback(g_pSession);
+		if (FAILED(g_pSession->BeginGetEvent(cb, nullptr)))
+			cb->Release();
+	}
+	return hr;
 }
 
-HRESULT CreateMediaSource(const wchar_t* url)
+HRESULT CreateMediaSource(const wchar_t* url, IMFMediaSource** ppSource)
 {
 	IMFSourceResolver* resolver = nullptr;
 	MF_OBJECT_TYPE type = MF_OBJECT_INVALID;
@@ -882,31 +967,26 @@ HRESULT CreateMediaSource(const wchar_t* url)
 		MF_RESOLUTION_MEDIASOURCE | MF_RESOLUTION_CONTENT_DOES_NOT_HAVE_TO_MATCH_EXTENSION_OR_MIME_TYPE,
 		nullptr,
 		&type,
-		(IUnknown**)&g_pSource
+		(IUnknown**)ppSource
 	);
 
 	resolver->Release();
 	return hr;
 }
 
-HRESULT CreateTopology()
+// 1つのメディアソースの全ストリームをトポロジへ接続する
+// (muxedなら映像+音声、DASHの単独ストリームなら片方のみが接続される)
+static HRESULT AddSourceToTopology(IMFTopology* topology, IMFMediaSource* source)
 {
-	IMFTopology* topology = nullptr;
 	IMFPresentationDescriptor* pd = nullptr;
 
-	HRESULT hr = MFCreateTopology(&topology);
+	HRESULT hr = source->CreatePresentationDescriptor(&pd);
 	if (FAILED(hr)) return hr;
-
-	hr = g_pSource->CreatePresentationDescriptor(&pd);
-	if (FAILED(hr))
-	{
-		topology->Release();
-		return hr;
-	}
 
 	UINT64 duration = 0;
 	pd->GetUINT64(MF_PD_DURATION, &duration);
-	InterlockedExchange64(&g_duration100ns, (LONGLONG)duration);
+	if ((LONGLONG)duration > g_duration100ns)
+		InterlockedExchange64(&g_duration100ns, (LONGLONG)duration);
 
 	DWORD streamCount = 0;
 	pd->GetStreamDescriptorCount(&streamCount);
@@ -943,7 +1023,7 @@ HRESULT CreateTopology()
 		hr = MFCreateTopologyNode(MF_TOPOLOGY_SOURCESTREAM_NODE, &srcNode);
 		if (FAILED(hr)) goto NEXT;
 
-		srcNode->SetUnknown(MF_TOPONODE_SOURCE, g_pSource);
+		srcNode->SetUnknown(MF_TOPONODE_SOURCE, source);
 		srcNode->SetUnknown(MF_TOPONODE_PRESENTATION_DESCRIPTOR, pd);
 		srcNode->SetUnknown(MF_TOPONODE_STREAM_DESCRIPTOR, sd);
 
@@ -984,26 +1064,75 @@ HRESULT CreateTopology()
 		sd->Release();
 	}
 
-	hr = g_pSession->SetTopology(0, topology);
-
 	pd->Release();
+	return S_OK;
+}
+
+HRESULT CreateTopology()
+{
+	IMFTopology* topology = nullptr;
+
+	HRESULT hr = MFCreateTopology(&topology);
+	if (FAILED(hr)) return hr;
+
+	InterlockedExchange64(&g_duration100ns, 0);
+
+	hr = AddSourceToTopology(topology, g_pSource);
+
+	if (SUCCEEDED(hr))
+		hr = g_pSession->SetTopology(0, topology);
+
 	topology->Release();
 	return hr;
 }
 
-HRESULT Play(const wchar_t* url)
+// audioUrl が空でなければDASH: 映像・音声ソースをMFCreateAggregateSourceで
+// 1つの合成ソースにまとめてから通常のトポロジに載せる
+// (Media Sessionは複数ソースを直接置いたトポロジをサポートしないため)
+HRESULT Play(const wchar_t* url, const wchar_t* audioUrl)
 {
 	HRESULT hr;
 	if (FAILED(hr = CreateSession())) return hr;
-	if (FAILED(hr = CreateMediaSource(url))) return hr;
+
+	if (audioUrl && *audioUrl)
+	{
+		IMFMediaSource* video = nullptr;
+		IMFMediaSource* audio = nullptr;
+		IMFCollection* col = nullptr;
+
+		hr = CreateMediaSource(url, &video);
+		if (SUCCEEDED(hr))
+			hr = CreateMediaSource(audioUrl, &audio);
+		if (SUCCEEDED(hr))
+			hr = MFCreateCollection(&col);
+		if (SUCCEEDED(hr))
+		{
+			col->AddElement(video);
+			col->AddElement(audio);
+			hr = MFCreateAggregateSource(col, &g_pSource);
+		}
+
+		if (col) col->Release();
+		if (FAILED(hr))
+		{
+			if (video) { video->Shutdown(); video->Release(); }
+			if (audio) { audio->Shutdown(); audio->Release(); }
+			return hr;
+		}
+		// 合成ソースが参照を保持するためローカル参照は解放してよい
+		video->Release();
+		audio->Release();
+	}
+	else
+	{
+		if (FAILED(hr = CreateMediaSource(url, &g_pSource))) return hr;
+	}
+
 	if (FAILED(hr = CreateTopology())) return hr;
 
 	PROPVARIANT var;
 	PropVariantInit(&var);
-	hr = g_pSession->Start(&GUID_NULL, &var);
-	if (SUCCEEDED(hr))
-		PostStatus(L"再生中");
-	return hr;
+	return g_pSession->Start(&GUID_NULL, &var);
 }
 
 // 現在の再生位置を秒で返す (-1 = 取得不可)
@@ -1052,7 +1181,10 @@ static void TogglePause()
 		g_pSession->Start(&GUID_NULL, &var);
 		g_isPaused = false;
 		SetWindowTextW(g_hPlayPauseBtn, L"一時停止");
-		SetStatus(L"再生中");
+		EnterCriticalSection(&g_cs);
+		std::wstring s = g_nowPlaying.empty() ? L"再生中" : g_nowPlaying;
+		LeaveCriticalSection(&g_cs);
+		SetStatus(s);
 	}
 	else
 	{
@@ -1092,17 +1224,189 @@ void ToFileUrl(const wchar_t* path, wchar_t* out, size_t outSize)
 	wsprintfW(out, L"file:///%c:%s", path[0], path + 2);
 }
 
-// 候補URLを前から順に試す (プロキシ経由が403でも直接リンクで再生できる場合がある)
+// 再生候補: audioが空ならmuxed/単一ファイル、非空ならDASH (映像+音声)
+struct PlayCandidate
+{
+	std::wstring video;
+	std::wstring audio;
+	std::wstring label;   // 表示用: "720p DASH" / "360p" 等
+};
+
 struct PlayParams
 {
-	std::vector<std::wstring> urls;
+	std::vector<PlayCandidate> urls;   // 前から順に試す
+	// DASH用 (videoIdが非空かつquality>0ならworker内でAPIから候補を先頭に追加)
+	std::wstring instanceUrl;
+	std::wstring videoId;
+	int quality;        // 目標の高さ (480/720/1080)。0ならDASHを使わない
+	bool localProxy;
 };
+
+// local=true時のAPIは相対パス (/videoplayback?...) を返すため絶対URL化する
+static std::wstring AbsolutizeUrl(const std::wstring& u, const std::wstring& instanceUrl)
+{
+	if (u.find(L"http://") == 0 || u.find(L"https://") == 0)
+		return u;
+	if (u.find(L"//") == 0)
+	{
+		// プロトコル相対 → インスタンスのスキームを補完
+		size_t p = instanceUrl.find(L"://");
+		if (p != std::wstring::npos)
+			return instanceUrl.substr(0, p + 1) + u;
+		return L"http:" + u;
+	}
+	if (!u.empty() && u[0] == L'/')
+		return instanceUrl + u;
+	return u;
+}
+
+// "bitrate":"123456" (文字列) と "bitrate":123456 (数値) の両方に対応
+static long long JsonGetNumberFlexible(const std::wstring& obj, const wchar_t* key)
+{
+	long long n = JsonGetNumber(obj, key);
+	if (n > 0) return n;
+	std::wstring s = JsonGetString(obj, key);
+	if (!s.empty()) return _wtoi64(s.c_str());
+	return n;
+}
+
+// adaptiveFormatsからH.264映像とAAC音声の最適ペアを選ぶ
+static bool PickDashStreams(const std::wstring& json, int targetHeight,
+                            std::wstring& videoUrl, std::wstring& audioUrl,
+                            std::wstring& label)
+{
+	std::wstring arr = JsonGetArray(json, L"adaptiveFormats");
+	if (arr.empty()) return false;
+
+	std::vector<std::wstring> objs;
+	SplitTopLevelObjects(arr, objs);
+
+	int bestH = 0;
+	bool best60 = false;
+	long long bestABr = -1;
+
+	for (size_t i = 0; i < objs.size(); i++)
+	{
+		std::wstring type = JsonGetString(objs[i], L"type");
+		std::wstring u = JsonGetString(objs[i], L"url");
+		if (u.empty()) continue;
+
+		if (type.find(L"video/mp4") == 0 && type.find(L"avc1") != std::wstring::npos)
+		{
+			// RTのハードウェアデコーダはH.264のみ (VP9/AV1不可)
+			std::wstring ql = JsonGetString(objs[i], L"qualityLabel");
+			int hgt = _wtoi(ql.c_str());
+			bool is60 = ql.find(L"p60") != std::wstring::npos;
+			if (hgt <= 0 || hgt > targetHeight) continue;
+			// 高解像度優先、同解像度ならRTの負荷が軽い30fpsを優先
+			if (hgt > bestH || (hgt == bestH && best60 && !is60))
+			{
+				bestH = hgt;
+				best60 = is60;
+				videoUrl = u;
+			}
+		}
+		else if (type.find(L"audio/mp4") == 0)
+		{
+			long long br = JsonGetNumberFlexible(objs[i], L"bitrate");
+			if (br > bestABr)
+			{
+				bestABr = br;
+				audioUrl = u;
+			}
+		}
+	}
+
+	if (bestH > 0)
+	{
+		wchar_t buf[32];
+		swprintf_s(buf, L"%dp%s DASH", bestH, best60 ? L"60" : L"");
+		label = buf;
+	}
+	return !videoUrl.empty() && !audioUrl.empty();
+}
+
+// Start後に再生クロックが実際に動き出すまで待つ。
+// 非同期エラーやタイムアウト時はfalseを返す (outHr: E_PENDING=タイムアウト)
+static bool WaitForPlaybackStart(HRESULT* outHr, int timeoutMs)
+{
+	for (int waited = 0; waited < timeoutMs; waited += 200)
+	{
+		LONG err = g_sessionErrorHr;
+		if (err != 0)
+		{
+			*outHr = (HRESULT)err;
+			return false;
+		}
+		if (!g_pSession)
+		{
+			*outHr = E_FAIL;
+			return false;
+		}
+
+		IMFClock* clock = nullptr;
+		if (SUCCEEDED(g_pSession->GetClock(&clock)))
+		{
+			MFCLOCK_STATE state = MFCLOCK_STATE_INVALID;
+			clock->GetState(0, &state);
+			clock->Release();
+			if (state == MFCLOCK_STATE_RUNNING)
+			{
+				*outHr = S_OK;
+				return true;
+			}
+		}
+		Sleep(200);
+	}
+	*outHr = E_PENDING;
+	return false;
+}
 
 DWORD WINAPI PlayThread(LPVOID param)
 {
 	PlayParams* pp = (PlayParams*)param;
 	bool played = false;
 	std::wstring lastErr;
+
+	// DASH候補の構築 (480p以上が選択されている場合)
+	// プロキシ経由 (local=true、相対URLで返るため絶対化) と直接URLの両方を用意
+	if (pp->quality > 0 && !pp->videoId.empty())
+	{
+		PostStatus(L"動画情報を取得中...");
+		std::wstring apiBase = pp->instanceUrl + L"/api/v1/videos/" + pp->videoId;
+
+		std::vector<PlayCandidate> dashCands;
+		for (int pass = 0; pass < 2; pass++)
+		{
+			bool useLocal = (pass == 0);
+			if (useLocal && !pp->localProxy)
+				continue;
+
+			std::string body;
+			std::wstring err;
+			if (!HttpGet(apiBase + (useLocal ? L"?local=true" : L""), body, err))
+			{
+				lastErr = L"動画情報取得失敗 (" + err + L")";
+				continue;
+			}
+
+			std::wstring json = Utf8ToWide(body);
+			PlayCandidate dash;
+			if (PickDashStreams(json, pp->quality, dash.video, dash.audio, dash.label))
+			{
+				dash.video = AbsolutizeUrl(dash.video, pp->instanceUrl);
+				dash.audio = AbsolutizeUrl(dash.audio, pp->instanceUrl);
+				if (!useLocal)
+					dash.label += L" 直接";
+				dashCands.push_back(dash);
+			}
+			else
+			{
+				lastErr = L"DASHストリームなし";
+			}
+		}
+		pp->urls.insert(pp->urls.begin(), dashCands.begin(), dashCands.end());
+	}
 
 	for (size_t i = 0; i < pp->urls.size(); i++)
 	{
@@ -1113,14 +1417,22 @@ DWORD WINAPI PlayThread(LPVOID param)
 			PostStatus(buf);
 		}
 
-		const std::wstring& u = pp->urls[i];
+		const PlayCandidate& c = pp->urls[i];
 
-		if (IsLocalPath(u.c_str()))
+		if (IsLocalPath(c.video.c_str()))
 		{
 			wchar_t fileUrl[2048] = {};
-			ToFileUrl(u.c_str(), fileUrl, 2048);
-			HRESULT hr = Play(fileUrl);
-			if (SUCCEEDED(hr)) { played = true; break; }
+			ToFileUrl(c.video.c_str(), fileUrl, 2048);
+			HRESULT hr = Play(fileUrl, nullptr);
+			if (SUCCEEDED(hr))
+			{
+				EnterCriticalSection(&g_cs);
+				g_nowPlaying = L"再生中";
+				LeaveCriticalSection(&g_cs);
+				PostStatus(L"再生中");
+				played = true;
+				break;
+			}
 			wchar_t buf[64];
 			swprintf_s(buf, L"hr=0x%08X", (unsigned)hr);
 			lastErr = buf;
@@ -1128,9 +1440,9 @@ DWORD WINAPI PlayThread(LPVOID param)
 		}
 
 		// 事前にWinHTTPで検証し、リダイレクト解決済みURLをMFに渡す
-		std::wstring resolved;
+		std::wstring resolvedVideo, resolvedAudio;
 		DWORD status = 0;
-		if (!ProbeStreamUrl(u, resolved, status))
+		if (!ProbeStreamUrl(c.video, resolvedVideo, status))
 		{
 			wchar_t buf[64];
 			if (status != 0)
@@ -1140,13 +1452,55 @@ DWORD WINAPI PlayThread(LPVOID param)
 			lastErr = buf;
 			continue;
 		}
+		if (!c.audio.empty())
+		{
+			if (!ProbeStreamUrl(c.audio, resolvedAudio, status))
+			{
+				wchar_t buf[64];
+				if (status != 0)
+					swprintf_s(buf, L"HTTP %u (音声)", status);
+				else
+					swprintf_s(buf, L"接続不可 (音声)");
+				lastErr = buf;
+				continue;
+			}
+		}
 
-		HRESULT hr = Play(resolved.c_str());
-		if (SUCCEEDED(hr)) { played = true; break; }
+		HRESULT hr = Play(resolvedVideo.c_str(),
+			resolvedAudio.empty() ? nullptr : resolvedAudio.c_str());
+		if (SUCCEEDED(hr))
+		{
+			// クロックが実際に動き出したことを確認してから成功扱いにする
+			HRESULT startErr = S_OK;
+			if (WaitForPlaybackStart(&startErr, 20000))
+			{
+				// 再生中の解像度と、フォールバックした場合はその理由を表示
+				std::wstring msg = L"再生中";
+				if (!c.label.empty())
+					msg += L" (" + c.label + L")";
+				if (i > 0 && !lastErr.empty())
+					msg += L" ※上位候補失敗: " + lastErr;
+
+				EnterCriticalSection(&g_cs);
+				g_nowPlaying = msg;
+				LeaveCriticalSection(&g_cs);
+				PostStatus(msg);
+
+				played = true;
+				break;
+			}
+			hr = startErr;
+			Cleanup();
+		}
 
 		wchar_t buf[64];
-		swprintf_s(buf, L"hr=0x%08X", (unsigned)hr);
+		if (hr == E_PENDING)
+			lstrcpyW(buf, L"開始タイムアウト");
+		else
+			swprintf_s(buf, L"hr=0x%08X", (unsigned)hr);
 		lastErr = buf;
+		if (!c.label.empty())
+			lastErr += L" (" + c.label + L")";
 	}
 
 	if (!played)
@@ -1184,7 +1538,8 @@ static void LoadSettings()
 	GetPrivateProfileStringW(L"Settings", L"InstanceUrl", L"http://", buf, 1024, ini.c_str());
 	g_instanceUrl = buf;
 
-	g_qualityIdx = GetPrivateProfileIntW(L"Settings", L"Quality", 0, ini.c_str()) ? 1 : 0;
+	g_qualityIdx = GetPrivateProfileIntW(L"Settings", L"Quality", 0, ini.c_str());
+	if (g_qualityIdx < 0 || g_qualityIdx > 3) g_qualityIdx = 0;
 	g_localProxy = GetPrivateProfileIntW(L"Settings", L"LocalProxy", 1, ini.c_str()) != 0;
 	g_ignoreCert = GetPrivateProfileIntW(L"Settings", L"IgnoreCert", 0, ini.c_str()) != 0;
 }
@@ -1250,18 +1605,27 @@ static void PlayVideoId(const std::wstring& videoId, const std::wstring& title)
 		return;
 	}
 
-	// 画質: itag 18 = 360p / itag 22 = 720p (どちらもH.264+AACのmuxed MP4)
-	// プロキシ経由(local=true)が403になる動画があるため、直接リンクや360pへ
-	// 順にフォールバックする
-	std::wstring base = instanceUrl + L"/latest_version?id=" + videoId + L"&itag=";
+	// 480p以上はDASH (adaptiveFormatsの映像+音声を合成)。
+	// 失敗時やDASHが無い場合は360p muxed (itag 18) へフォールバック。
+	static const int qmap[4] = { 0, 480, 720, 1080 };
 	PlayParams* pp = new PlayParams;
-	if (g_qualityIdx == 1)
+	pp->instanceUrl = instanceUrl;
+	pp->videoId = videoId;
+	pp->quality = qmap[(g_qualityIdx >= 0 && g_qualityIdx <= 3) ? g_qualityIdx : 0];
+	pp->localProxy = g_localProxy;
+
+	// muxedフォールバック (プロキシ経由 → 直接)
+	std::wstring base = instanceUrl + L"/latest_version?id=" + videoId + L"&itag=18";
+	PlayCandidate c;
+	c.label = L"360p";
+	if (g_localProxy)
 	{
-		if (g_localProxy) pp->urls.push_back(base + L"22&local=true");
-		pp->urls.push_back(base + L"22");
+		c.video = base + L"&local=true";
+		pp->urls.push_back(c);
 	}
-	if (g_localProxy) pp->urls.push_back(base + L"18&local=true");
-	pp->urls.push_back(base + L"18");
+	c.video = base;
+	c.label = L"360p 直接";
+	pp->urls.push_back(c);
 
 	EnterPlayerView(title);
 	SetStatus(L"読み込み中...");
@@ -1307,9 +1671,11 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 		CreateLabel(hWnd, L"画質:", M, y + S(3), S(60));
 		hQuality = CreateWindowW(L"COMBOBOX", nullptr,
 			WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
-			M + S(66), y, S(100), S(200), hWnd, (HMENU)IDC_SET_QUALITY, nullptr, nullptr);
+			M + S(66), y, S(130), S(200), hWnd, (HMENU)IDC_SET_QUALITY, nullptr, nullptr);
 		SendMessageW(hQuality, CB_ADDSTRING, 0, (LPARAM)L"360p");
-		SendMessageW(hQuality, CB_ADDSTRING, 0, (LPARAM)L"720p");
+		SendMessageW(hQuality, CB_ADDSTRING, 0, (LPARAM)L"480p (DASH)");
+		SendMessageW(hQuality, CB_ADDSTRING, 0, (LPARAM)L"720p (DASH)");
+		SendMessageW(hQuality, CB_ADDSTRING, 0, (LPARAM)L"1080p (DASH)");
 		SendMessageW(hQuality, CB_SETCURSEL, g_qualityIdx, 0);
 		y += S(36);
 
@@ -1345,7 +1711,8 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 		if (LOWORD(wp) == IDC_SET_OK)
 		{
 			g_instanceUrl = TrimTrailingSlash(GetWindowTextStr(hInst));
-			g_qualityIdx = (int)SendMessageW(hQuality, CB_GETCURSEL, 0, 0) == 1 ? 1 : 0;
+			g_qualityIdx = (int)SendMessageW(hQuality, CB_GETCURSEL, 0, 0);
+			if (g_qualityIdx < 0 || g_qualityIdx > 3) g_qualityIdx = 0;
 			g_localProxy = SendMessageW(hLocal, BM_GETCHECK, 0, 0) == BST_CHECKED;
 			g_ignoreCert = SendMessageW(hCert, BM_GETCHECK, 0, 0) == BST_CHECKED;
 			SaveSettings();
@@ -1710,7 +2077,11 @@ static void StartSearch()
 	if (query.find(L"http://") == 0 || query.find(L"https://") == 0 || IsLocalPath(query.c_str()))
 	{
 		PlayParams* pp = new PlayParams;
-		pp->urls.push_back(query);
+		pp->quality = 0;
+		pp->localProxy = false;
+		PlayCandidate c;
+		c.video = query;
+		pp->urls.push_back(c);
 		EnterPlayerView(query);
 		SetStatus(L"読み込み中...");
 		CreateThread(nullptr, 0, PlayThread, pp, 0, nullptr);
