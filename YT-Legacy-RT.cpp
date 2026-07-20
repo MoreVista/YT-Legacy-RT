@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include "resource.h"
 
 #pragma comment(lib, "mf.lib")
 #pragma comment(lib, "mfplat.lib")
@@ -1746,7 +1747,21 @@ struct PlayParams
 	std::wstring videoId;
 	int quality;        // 目標の高さ (480/720/1080)。0ならDASHを使わない
 	bool localProxy;
+	int resumeSeekSec = -1;  // >=0 なら再生開始後にこの秒へシーク (スリープ復帰用)
+	bool resumePaused = false;  // 復帰時に一時停止状態を復元するか
 };
+
+// 現在の再生を再構築するための記述 (スリープ復帰時に使用)。g_cs で保護
+struct PlaybackDesc
+{
+	bool valid;
+	std::wstring videoId;      // 空なら rawUrl を使う
+	std::wstring rawUrl;       // 直接URL / ローカルパス
+	std::wstring instanceUrl;
+	int quality;
+	bool localProxy;
+};
+PlaybackDesc g_curPlayback = {};
 
 // "bitrate":"123456" (文字列) と "bitrate":123456 (数値) の両方に対応
 static long long JsonGetNumberFlexible(const std::wstring& obj, const wchar_t* key)
@@ -1850,6 +1865,27 @@ static bool WaitForPlaybackStart(HRESULT* outHr, int timeoutMs)
 	return false;
 }
 
+// 再生成功後、スリープ復帰時は元の位置へシークし一時停止状態も復元する。
+// 復帰時は自前でステータス/ボタンを更新するので通常の再生中表示は抑制する。
+static void ApplyResume(PlayParams* pp, const std::wstring& playingMsg)
+{
+	g_isPaused = false;
+	if (pp->resumeSeekSec > 0)
+		SeekToSec(pp->resumeSeekSec);
+	if (pp->resumePaused)
+	{
+		g_pSession->Pause();
+		g_isPaused = true;
+		SetWindowTextW(g_hPlayPauseBtn, Tr(L"play_btn").c_str());
+		PostStatus(Tr(L"paused"));
+	}
+	else
+	{
+		SetWindowTextW(g_hPlayPauseBtn, Tr(L"pause_btn").c_str());
+		PostStatus(playingMsg);
+	}
+}
+
 DWORD WINAPI PlayThread(LPVOID param)
 {
 	PlayParams* pp = (PlayParams*)param;
@@ -1918,7 +1954,10 @@ DWORD WINAPI PlayThread(LPVOID param)
 				EnterCriticalSection(&g_cs);
 				g_nowPlaying = playing;
 				LeaveCriticalSection(&g_cs);
-				PostStatus(playing);
+				if (pp->resumeSeekSec >= 0)
+					ApplyResume(pp, playing);
+				else
+					PostStatus(playing);
 				played = true;
 				break;
 			}
@@ -1982,7 +2021,11 @@ DWORD WINAPI PlayThread(LPVOID param)
 				EnterCriticalSection(&g_cs);
 				g_nowPlaying = msg;
 				LeaveCriticalSection(&g_cs);
-				PostStatus(msg);
+
+				if (pp->resumeSeekSec >= 0)
+					ApplyResume(pp, msg);
+				else
+					PostStatus(msg);
 
 				played = true;
 				break;
@@ -2136,6 +2179,44 @@ static void ReturnToPlayer()
 	RefreshAll();
 }
 
+// PlaybackDesc から再生候補を組み立てる (通常再生・スリープ復帰で共用)
+static PlayParams* BuildPlayParams(const PlaybackDesc& d)
+{
+	PlayParams* pp = new PlayParams;
+	pp->instanceUrl = d.instanceUrl;
+
+	if (!d.videoId.empty())
+	{
+		// 480p以上はDASH (adaptiveFormatsの映像+音声を合成)。
+		// 失敗時やDASHが無い場合は360p muxed (itag 18) へフォールバック。
+		pp->videoId = d.videoId;
+		pp->quality = d.quality;
+		pp->localProxy = d.localProxy;
+
+		std::wstring base = d.instanceUrl + L"/latest_version?id=" + d.videoId + L"&itag=18";
+		PlayCandidate c;
+		c.label = L"360p";
+		if (d.localProxy)
+		{
+			c.video = base + L"&local=true";
+			pp->urls.push_back(c);
+		}
+		c.video = base;
+		c.label = L"360p " + Tr(L"direct_suffix");
+		pp->urls.push_back(c);
+	}
+	else
+	{
+		// 直接URL / ローカルパス
+		pp->quality = 0;
+		pp->localProxy = false;
+		PlayCandidate c;
+		c.video = d.rawUrl;
+		pp->urls.push_back(c);
+	}
+	return pp;
+}
+
 static void PlayVideoId(const std::wstring& videoId, const std::wstring& title)
 {
 	std::wstring instanceUrl = TrimTrailingSlash(g_instanceUrl);
@@ -2145,27 +2226,20 @@ static void PlayVideoId(const std::wstring& videoId, const std::wstring& title)
 		return;
 	}
 
-	// 480p以上はDASH (adaptiveFormatsの映像+音声を合成)。
-	// 失敗時やDASHが無い場合は360p muxed (itag 18) へフォールバック。
 	static const int qmap[4] = { 0, 480, 720, 1080 };
-	PlayParams* pp = new PlayParams;
-	pp->instanceUrl = instanceUrl;
-	pp->videoId = videoId;
-	pp->quality = qmap[(g_qualityIdx >= 0 && g_qualityIdx <= 3) ? g_qualityIdx : 0];
-	pp->localProxy = g_localProxy;
 
-	// muxedフォールバック (プロキシ経由 → 直接)
-	std::wstring base = instanceUrl + L"/latest_version?id=" + videoId + L"&itag=18";
-	PlayCandidate c;
-	c.label = L"360p";
-	if (g_localProxy)
-	{
-		c.video = base + L"&local=true";
-		pp->urls.push_back(c);
-	}
-	c.video = base;
-	c.label = L"360p " + Tr(L"direct_suffix");
-	pp->urls.push_back(c);
+	// スリープ復帰時に再構築できるよう現在の再生内容を記録
+	PlaybackDesc d = {};
+	d.valid = true;
+	d.videoId = videoId;
+	d.instanceUrl = instanceUrl;
+	d.quality = qmap[(g_qualityIdx >= 0 && g_qualityIdx <= 3) ? g_qualityIdx : 0];
+	d.localProxy = g_localProxy;
+	EnterCriticalSection(&g_cs);
+	g_curPlayback = d;
+	LeaveCriticalSection(&g_cs);
+
+	PlayParams* pp = BuildPlayParams(d);
 
 	EnterPlayerView(title);
 	SetStatus(Tr(L"loading"));
@@ -2832,12 +2906,15 @@ static void StartSearch()
 	// URLやローカルパスを直接入力した場合はそのまま再生
 	if (query.find(L"http://") == 0 || query.find(L"https://") == 0 || IsLocalPath(query.c_str()))
 	{
-		PlayParams* pp = new PlayParams;
-		pp->quality = 0;
-		pp->localProxy = false;
-		PlayCandidate c;
-		c.video = query;
-		pp->urls.push_back(c);
+		PlaybackDesc d = {};
+		d.valid = true;
+		d.rawUrl = query;
+		d.instanceUrl = instanceUrl;
+		EnterCriticalSection(&g_cs);
+		g_curPlayback = d;
+		LeaveCriticalSection(&g_cs);
+
+		PlayParams* pp = BuildPlayParams(d);
 		EnterPlayerView(query);
 		SetStatus(Tr(L"loading"));
 		CreateThread(nullptr, 0, PlayThread, pp, 0, nullptr);
@@ -3012,6 +3089,37 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 			UpdateSeekUI();
 		break;
 
+	case WM_POWERBROADCAST:
+		// スリープ復帰時、EVRのDirect3Dデバイスが失われ映像だけ止まることがある。
+		// 現在位置を保持したまま再生を作り直して映像を復活させる。
+		if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND)
+		{
+			static DWORD s_lastResume = 0;
+			DWORD now = GetTickCount();
+			bool haveSession;
+			EnterCriticalSection(&g_cs);
+			haveSession = (g_pSession != nullptr) && g_curPlayback.valid;
+			LeaveCriticalSection(&g_cs);
+
+			// 復帰イベントは2種類飛ぶことがあるので短時間の重複を無視
+			if (haveSession && (now - s_lastResume > 3000))
+			{
+				s_lastResume = now;
+				int pos = GetPositionSec();
+
+				PlaybackDesc d;
+				EnterCriticalSection(&g_cs);
+				d = g_curPlayback;
+				LeaveCriticalSection(&g_cs);
+
+				PlayParams* pp = BuildPlayParams(d);
+				pp->resumeSeekSec = (pos > 0) ? pos : 0;
+				pp->resumePaused = g_isPaused;
+				CreateThread(nullptr, 0, PlayThread, pp, 0, nullptr);
+			}
+		}
+		return TRUE;
+
 	case WM_KEYDOWN:
 		if (wp == VK_ESCAPE && g_fullscreen)
 			ToggleFullscreen();
@@ -3134,6 +3242,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 
 		case IDC_MINI_CLOSE:
 			// 再生を停止してミニプレイヤーを閉じる
+			EnterCriticalSection(&g_cs);
+			g_curPlayback.valid = false;   // 復帰対象を無効化
+			LeaveCriticalSection(&g_cs);
 			Cleanup();
 			Layout(hWnd);
 			SetStatus(Tr(L"ready"));
@@ -3339,9 +3450,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmd)
 	LoadSettings();
 	ReloadLanguage();
 
+	HICON hAppIcon = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APPICON));
+
 	WNDCLASSW wc = {};
 	wc.lpfnWndProc = WndProc;
 	wc.hInstance = hInst;
+	wc.hIcon = hAppIcon;
 	wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
 	wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
 	wc.lpszClassName = L"YTLegacyRT";

@@ -1,0 +1,6 @@
+#include "resource.h"
+
+// アプリケーションアイコン
+// 差し替える場合は同じフォルダの YT-Legacy-RT.ico を置き換えてください。
+// (先頭のアイコンが exe / タスクバー / タイトルバーに使われます)
+IDI_APPICON ICON "YT-Legacy-RT.ico"
