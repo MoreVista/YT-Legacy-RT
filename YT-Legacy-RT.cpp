@@ -69,6 +69,9 @@ enum
 	IDC_SET_IGNORECERT,
 	IDC_SET_OK,
 	IDC_SET_CANCEL,
+
+	// 概要ウィンドウ
+	IDC_DESC_EDIT = 300,
 };
 
 #define WM_APP_SEARCHDONE  (WM_APP + 1)   // wParam: 検索世代
@@ -153,6 +156,8 @@ std::wstring g_watchStats;             // 再生数・高評価などの表示�
 std::wstring g_nowPlaying;             // 「再生中 (720p DASH)」等 (g_cs で保護)
 std::wstring g_chanId;                 // 再生中動画のチャンネルID (g_cs で保護)
 std::wstring g_chanTitle;              // 同チャンネル名 (g_cs で保護)
+std::wstring g_videoTitle;             // 再生中動画のタイトル (g_cs で保護)
+std::wstring g_videoDescription;       // 再生中動画の概要 (g_cs で保護)
 LONG g_recGen = 0;                     // 動画情報の世代
 
 WNDPROC g_oldEditProc = nullptr;
@@ -164,6 +169,13 @@ DWORD WINAPI ThumbThread(LPVOID param);
 DWORD WINAPI WatchThread(LPVOID param);
 static void StartSearch();
 static void ToggleFullscreen();
+
+// スムーズスクロールリスト (定義は後方)
+static void SL_SetItemHeight(HWND h, int ih);
+static void SL_SetCount(HWND h, int c);
+static void SL_Reset(HWND h);
+static int  SL_GetSel(HWND h);
+static void SL_InvalidateItem(HWND h, int idx);
 
 static int S(int px) { return MulDiv(px, g_dpi, 96); }
 
@@ -290,6 +302,8 @@ static const wchar_t* LANG_EN[][2] = {
 	{ L"subs_btn",        L"Subscriptions" },
 	{ L"channels_found",  L"%d channels" },
 	{ L"no_subs",         L"No subscribed channels" },
+	{ L"description_title", L"Description" },
+	{ L"no_description",  L"No description available" },
 	{ L"num_style",       L"west" },
 };
 
@@ -344,6 +358,8 @@ static const wchar_t* LANG_JA[][2] = {
 	{ L"subs_btn",        L"登録チャンネル" },
 	{ L"channels_found",  L"%d件のチャンネル" },
 	{ L"no_subs",         L"登録チャンネルはありません" },
+	{ L"description_title", L"概要" },
+	{ L"no_description",  L"概要はありません" },
 	{ L"num_style",       L"jp" },
 };
 
@@ -1168,7 +1184,7 @@ DWORD WINAPI WatchThread(LPVOID param)
 
 	std::wstring stats;
 	std::vector<VideoItem> recs;
-	std::wstring chanId, chanTitle, iconUrl;
+	std::wstring chanId, chanTitle, iconUrl, videoTitle, description;
 	if (ok)
 	{
 		std::wstring json = Utf8ToWide(body);
@@ -1203,6 +1219,8 @@ DWORD WINAPI WatchThread(LPVOID param)
 		long long likes = JsonGetNumber(top, L"likeCount");
 		std::wstring author = JsonGetString(top, L"author");
 		std::wstring published = JsonGetString(top, L"publishedText");
+		videoTitle = JsonGetString(top, L"title");
+		description = JsonGetString(top, L"description");
 
 		// チャンネル情報 (アイコンは76px以上の最小サイズを選ぶ)
 		chanId = JsonGetString(top, L"authorId");
@@ -1251,6 +1269,8 @@ DWORD WINAPI WatchThread(LPVOID param)
 		g_watchStats = stats;
 		g_chanId = chanId;
 		g_chanTitle = chanTitle;
+		g_videoTitle = videoTitle;
+		g_videoDescription = description;
 		LeaveCriticalSection(&g_cs);
 		PostMessageW(g_hWnd, WM_APP_WATCHINFO, (WPARAM)wp->gen, 0);
 
@@ -2125,12 +2145,19 @@ static void EnterPlayerView(const std::wstring& title)
 	g_isPaused = false;
 	g_userSeeking = false;
 	g_seekBarMax = -1;
+
+	// 概要は WatchThread の取得完了まで空にしておく
+	EnterCriticalSection(&g_cs);
+	g_videoTitle = title;
+	g_videoDescription.clear();
+	LeaveCriticalSection(&g_cs);
+
 	SetWindowTextW(g_hPlayerTitle, title.c_str());
 	SetWindowTextW(g_hPlayPauseBtn, Tr(L"pause_btn").c_str());
 	SetWindowTextW(g_hTimeLabel, L"--:-- / --:--");
 	SetWindowTextW(g_hStatsLabel, L"");
 	SendMessageW(g_hSeekBar, TBM_SETPOS, TRUE, 0);
-	SendMessageW(g_hRecList, LB_RESETCONTENT, 0, 0);
+	SL_Reset(g_hRecList);
 
 	// チャンネルバーを初期化
 	SetWindowTextW(g_hChanName, L"");
@@ -2438,6 +2465,79 @@ static void OpenSettings()
 		x, y, w, h, g_hWnd, nullptr, nullptr, nullptr);
 }
 
+// ---------------------------------------------------------------------------
+// 概要 (動画の説明) ウィンドウ
+// ---------------------------------------------------------------------------
+LRESULT CALLBACK DescWndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+	switch (msg)
+	{
+	case WM_CREATE:
+	{
+		// 概要を読み出し、改行を CRLF に変換 (EDITコントロール用)
+		std::wstring desc;
+		EnterCriticalSection(&g_cs);
+		desc = g_videoDescription;
+		LeaveCriticalSection(&g_cs);
+		if (desc.empty())
+			desc = Tr(L"no_description");
+
+		std::wstring crlf;
+		crlf.reserve(desc.size());
+		for (size_t i = 0; i < desc.size(); i++)
+		{
+			if (desc[i] == L'\n') crlf += L"\r\n";
+			else if (desc[i] != L'\r') crlf += desc[i];
+		}
+
+		RECT rc;
+		GetClientRect(hWnd, &rc);
+		HWND edit = CreateWindowW(L"EDIT", crlf.c_str(),
+			WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+			0, 0, rc.right, rc.bottom, hWnd, (HMENU)IDC_DESC_EDIT, nullptr, nullptr);
+		SendMessageW(edit, WM_SETFONT, (WPARAM)g_hFontUI, TRUE);
+		break;
+	}
+
+	case WM_SIZE:
+	{
+		HWND edit = GetDlgItem(hWnd, IDC_DESC_EDIT);
+		if (edit)
+			MoveWindow(edit, 0, 0, LOWORD(lp), HIWORD(lp), TRUE);
+		break;
+	}
+
+	case WM_CLOSE:
+		DestroyWindow(hWnd);
+		break;
+
+	case WM_DESTROY:
+		EnableWindow(g_hWnd, TRUE);
+		SetForegroundWindow(g_hWnd);
+		break;
+	}
+	return DefWindowProc(hWnd, msg, wp, lp);
+}
+
+static void OpenDescription()
+{
+	RECT rc;
+	GetWindowRect(g_hWnd, &rc);
+	int w = S(520), h = S(420);
+	int x = rc.left + ((rc.right - rc.left) - w) / 2;
+	int y = rc.top + ((rc.bottom - rc.top) - h) / 2;
+
+	std::wstring title;
+	EnterCriticalSection(&g_cs);
+	title = g_videoTitle.empty() ? Tr(L"description_title") : g_videoTitle;
+	LeaveCriticalSection(&g_cs);
+
+	EnableWindow(g_hWnd, FALSE);
+	CreateWindowW(L"YTLegacyRTDesc", title.c_str(),
+		WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_SIZEBOX | WS_VISIBLE,
+		x, y, w, h, g_hWnd, nullptr, nullptr, nullptr);
+}
+
 // 言語変更をメインウィンドウの各コントロールへ反映する
 static void ApplyUiTexts()
 {
@@ -2551,15 +2651,14 @@ static void UpdateSeekUI()
 // ---------------------------------------------------------------------------
 static int ItemHeight() { return ThumbH() + S(16); }
 
-static void DrawListItem(DRAWITEMSTRUCT* dis)
+static void DrawCard(HDC dc, const RECT& rcItem, int ctlId, int idx, bool selected)
 {
-	HDC dc = dis->hDC;
-	RECT rc = dis->rcItem;
+	RECT rc = rcItem;
 
 	// 背景
 	FillRect(dc, &rc, (HBRUSH)(COLOR_WINDOW + 1));
 
-	if (dis->itemID == (UINT)-1) return;
+	if (idx < 0) return;
 
 	// カード領域
 	RECT card = rc;
@@ -2568,7 +2667,6 @@ static void DrawListItem(DRAWITEMSTRUCT* dis)
 	card.top += S(3);
 	card.bottom -= S(3);
 
-	bool selected = (dis->itemState & ODS_SELECTED) != 0;
 	HBRUSH bg = CreateSolidBrush(selected ? RGB(229, 241, 251) : RGB(255, 255, 255));
 	FillRect(dc, &card, bg);
 	DeleteObject(bg);
@@ -2577,14 +2675,13 @@ static void DrawListItem(DRAWITEMSTRUCT* dis)
 	DeleteObject(frame);
 
 	int pad = S(5);
-	int idx = (int)dis->itemID;
-	bool channelMode = (g_listMode == 1 && dis->CtlID == IDC_LIST);
+	bool channelMode = (g_listMode == 1 && ctlId == IDC_LIST);
 
 	std::wstring title, author;
 	long long len = -1;
 	HBITMAP thumb = nullptr;
 	EnterCriticalSection(&g_cs);
-	std::vector<VideoItem>& items = (dis->CtlID == IDC_REC_LIST) ? g_recResults : g_results;
+	std::vector<VideoItem>& items = (ctlId == IDC_REC_LIST) ? g_recResults : g_results;
 	if (idx < (int)items.size())
 	{
 		title = items[idx].title;
@@ -2660,6 +2757,266 @@ static void DrawListItem(DRAWITEMSTRUCT* dis)
 	SetTextColor(dc, RGB(110, 110, 110));
 	SelectObject(dc, g_hFontSmall);
 	DrawTextW(dc, author.c_str(), -1, &authorRc, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+}
+
+// ---------------------------------------------------------------------------
+// スムーズスクロール対応の独自リスト (標準LISTBOXは項目単位でしか動かないため)
+// ピクセル単位でスクロールし、ホイールはイージング、タッチはパン+慣性に対応。
+// ---------------------------------------------------------------------------
+struct SmoothList
+{
+	int itemHeight;
+	int count;
+	int sel;
+	double scrollY;    // 現在のスクロール位置 (px)
+	double target;     // ホイール等の目標位置 (px)
+	bool anim;
+	int panLastY;
+};
+
+#define SL_TIMER_ANIM 1
+
+static SmoothList* SL(HWND h) { return (SmoothList*)GetWindowLongPtrW(h, GWLP_USERDATA); }
+
+static int SL_MaxScroll(HWND h, SmoothList* s)
+{
+	RECT rc; GetClientRect(h, &rc);
+	int m = s->count * s->itemHeight - rc.bottom;
+	return m > 0 ? m : 0;
+}
+
+static void SL_UpdateScrollbar(HWND h, SmoothList* s)
+{
+	RECT rc; GetClientRect(h, &rc);
+	SCROLLINFO si = { sizeof(si) };
+	si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+	si.nMin = 0;
+	si.nMax = (s->count > 0) ? (s->count * s->itemHeight - 1) : 0;
+	si.nPage = rc.bottom;
+	si.nPos = (int)(s->scrollY + 0.5);
+	SetScrollInfo(h, SB_VERT, &si, TRUE);
+}
+
+static void SL_Clamp(HWND h, SmoothList* s)
+{
+	int m = SL_MaxScroll(h, s);
+	if (s->target < 0) s->target = 0;
+	if (s->target > m) s->target = m;
+	if (s->scrollY < 0) s->scrollY = 0;
+	if (s->scrollY > m) s->scrollY = m;
+}
+
+// アプリ側から使うヘルパ (LISTBOXメッセージの代替)
+static void SL_SetItemHeight(HWND h, int ih)
+{
+	SmoothList* s = SL(h); if (!s) return;
+	s->itemHeight = ih > 0 ? ih : 1;
+	SL_Clamp(h, s); SL_UpdateScrollbar(h, s);
+	InvalidateRect(h, nullptr, TRUE);
+}
+static void SL_SetCount(HWND h, int c)
+{
+	SmoothList* s = SL(h); if (!s) return;
+	s->count = c;
+	s->sel = -1;
+	s->scrollY = 0; s->target = 0; s->anim = false;
+	KillTimer(h, SL_TIMER_ANIM);
+	SL_UpdateScrollbar(h, s);
+	InvalidateRect(h, nullptr, TRUE);
+}
+static void SL_Reset(HWND h) { SL_SetCount(h, 0); }
+static int SL_GetSel(HWND h) { SmoothList* s = SL(h); return s ? s->sel : -1; }
+static void SL_InvalidateItem(HWND h, int idx)
+{
+	SmoothList* s = SL(h); if (!s) return;
+	RECT rc; GetClientRect(h, &rc);
+	int y = idx * s->itemHeight - (int)s->scrollY;
+	RECT r = { 0, y, rc.right, y + s->itemHeight };
+	InvalidateRect(h, &r, FALSE);
+}
+
+LRESULT CALLBACK SmoothListProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+	SmoothList* s = SL(h);
+
+	switch (msg)
+	{
+	case WM_CREATE:
+	{
+		s = new SmoothList();
+		s->itemHeight = ItemHeight();
+		s->count = 0; s->sel = -1;
+		s->scrollY = 0; s->target = 0; s->anim = false; s->panLastY = 0;
+		SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)s);
+		// タッチのパン+慣性を有効化
+		GESTURECONFIG gc = { 0,
+			GC_PAN | GC_PAN_WITH_INERTIA | GC_PAN_WITH_SINGLE_FINGER_VERTICALLY, 0 };
+		SetGestureConfig(h, 0, 1, &gc, sizeof(GESTURECONFIG));
+		return 0;
+	}
+
+	case WM_NCDESTROY:
+		if (s) { KillTimer(h, SL_TIMER_ANIM); delete s; SetWindowLongPtrW(h, GWLP_USERDATA, 0); }
+		break;
+
+	case WM_ERASEBKGND:
+		return 1;
+
+	case WM_PAINT:
+	{
+		PAINTSTRUCT ps;
+		HDC dc = BeginPaint(h, &ps);
+		RECT rc; GetClientRect(h, &rc);
+
+		// ダブルバッファ
+		HDC mem = CreateCompatibleDC(dc);
+		HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+		HGDIOBJ ob = SelectObject(mem, bmp);
+		FillRect(mem, &rc, (HBRUSH)(COLOR_WINDOW + 1));
+
+		if (s)
+		{
+			int ih = s->itemHeight > 0 ? s->itemHeight : 1;
+			int ctlId = GetDlgCtrlID(h);
+			int sy = (int)(s->scrollY + 0.5);
+			int first = sy / ih;
+			int y = first * ih - sy;
+			for (int i = first; i < s->count && y < rc.bottom; i++, y += ih)
+			{
+				RECT ir = { 0, y, rc.right, y + ih };
+				DrawCard(mem, ir, ctlId, i, i == s->sel);
+			}
+		}
+
+		BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+		SelectObject(mem, ob);
+		DeleteObject(bmp);
+		DeleteDC(mem);
+		EndPaint(h, &ps);
+		return 0;
+	}
+
+	case WM_SIZE:
+		if (s) { SL_Clamp(h, s); SL_UpdateScrollbar(h, s); InvalidateRect(h, nullptr, TRUE); }
+		return 0;
+
+	case WM_MOUSEWHEEL:
+	{
+		if (!s) break;
+		short d = GET_WHEEL_DELTA_WPARAM(wp);
+		UINT lines = 3;
+		SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+		if (lines == 0) lines = 3;
+		double step = S(24) * (double)lines;    // 1ノッチあたりのピクセル量
+		s->target -= (d / 120.0) * step;
+		SL_Clamp(h, s);
+		s->anim = true;
+		SetTimer(h, SL_TIMER_ANIM, 15, nullptr);
+		return 0;
+	}
+
+	case WM_TIMER:
+		if (wp == SL_TIMER_ANIM && s)
+		{
+			double diff = s->target - s->scrollY;
+			s->scrollY += diff * 0.30;
+			if (diff > -0.5 && diff < 0.5)
+			{
+				s->scrollY = s->target;
+				s->anim = false;
+				KillTimer(h, SL_TIMER_ANIM);
+			}
+			SL_UpdateScrollbar(h, s);
+			InvalidateRect(h, nullptr, FALSE);
+		}
+		return 0;
+
+	case WM_VSCROLL:
+	{
+		if (!s) break;
+		SCROLLINFO si = { sizeof(si) };
+		si.fMask = SIF_ALL;
+		GetScrollInfo(h, SB_VERT, &si);
+		int pos = si.nPos;
+		switch (LOWORD(wp))
+		{
+		case SB_LINEUP:   pos -= s->itemHeight / 3; break;
+		case SB_LINEDOWN: pos += s->itemHeight / 3; break;
+		case SB_PAGEUP:   pos -= si.nPage; break;
+		case SB_PAGEDOWN: pos += si.nPage; break;
+		case SB_THUMBTRACK:
+		case SB_THUMBPOSITION: pos = si.nTrackPos; break;
+		}
+		// スクロールバー操作は即時反映 (イージングなし)
+		s->scrollY = pos; s->target = pos;
+		SL_Clamp(h, s);
+		s->anim = false; KillTimer(h, SL_TIMER_ANIM);
+		SL_UpdateScrollbar(h, s);
+		InvalidateRect(h, nullptr, FALSE);
+		return 0;
+	}
+
+	case WM_GESTURE:
+	{
+		if (!s) break;
+		GESTUREINFO gi = { sizeof(GESTUREINFO) };
+		if (GetGestureInfo((HGESTUREINFO)lp, &gi))
+		{
+			if (gi.dwID == GID_PAN)
+			{
+				int y = gi.ptsLocation.y;
+				if (gi.dwFlags & GF_BEGIN)
+					s->panLastY = y;
+				else
+				{
+					int dy = s->panLastY - y;   // 指を上へ動かすと下スクロール
+					s->panLastY = y;
+					s->scrollY += dy; s->target = s->scrollY;
+					SL_Clamp(h, s);
+					SL_UpdateScrollbar(h, s);
+					InvalidateRect(h, nullptr, FALSE);
+				}
+			}
+			CloseGestureInfoHandle((HGESTUREINFO)lp);
+			return 0;
+		}
+		break;
+	}
+
+	case WM_LBUTTONDOWN:
+	{
+		if (!s) break;
+		SetFocus(h);
+		int y = GET_Y_LPARAM(lp);
+		int idx = ((int)s->scrollY + y) / (s->itemHeight > 0 ? s->itemHeight : 1);
+		if (idx >= 0 && idx < s->count) { s->sel = idx; InvalidateRect(h, nullptr, FALSE); }
+		return 0;
+	}
+
+	case WM_LBUTTONDBLCLK:
+	{
+		if (!s) break;
+		int y = GET_Y_LPARAM(lp);
+		int idx = ((int)s->scrollY + y) / (s->itemHeight > 0 ? s->itemHeight : 1);
+		if (idx >= 0 && idx < s->count)
+		{
+			s->sel = idx;
+			InvalidateRect(h, nullptr, FALSE);
+			// 既存の LBN_DBLCLK ハンドラをそのまま流用する
+			SendMessageW(GetParent(h), WM_COMMAND,
+				MAKEWPARAM(GetDlgCtrlID(h), LBN_DBLCLK), (LPARAM)h);
+		}
+		return 0;
+	}
+	}
+	return DefWindowProc(h, msg, wp, lp);
+}
+
+static HWND CreateSmoothList(HWND parent, HINSTANCE hInst, int id, bool visible)
+{
+	DWORD style = WS_CHILD | WS_VSCROLL | (visible ? WS_VISIBLE : 0);
+	return CreateWindowW(L"YTSmoothList", nullptr, style,
+		0, 0, 0, 0, parent, (HMENU)(INT_PTR)id, hInst, nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -2818,8 +3175,6 @@ static void Layout(HWND hWnd)
 
 static void FillResultList()
 {
-	SendMessageW(g_hList, LB_RESETCONTENT, 0, 0);
-
 	int count;
 	std::wstring status;
 	EnterCriticalSection(&g_cs);
@@ -2827,8 +3182,8 @@ static void FillResultList()
 	status = g_searchError;
 	LeaveCriticalSection(&g_cs);
 
-	for (int i = 0; i < count; i++)
-		SendMessageW(g_hList, LB_ADDSTRING, 0, (LPARAM)i);
+	SL_SetItemHeight(g_hList, ItemHeight());
+	SL_SetCount(g_hList, count);
 
 	if (status.empty())
 	{
@@ -2870,11 +3225,8 @@ static void ShowSubscriptions()
 	LeaveCriticalSection(&g_cs);
 
 	g_listMode = 1;
-	SendMessageW(g_hList, LB_SETITEMHEIGHT, 0, S(44));
-	SendMessageW(g_hList, LB_RESETCONTENT, 0, 0);
-	for (int i = 0; i < count; i++)
-		SendMessageW(g_hList, LB_ADDSTRING, 0, (LPARAM)i);
-	InvalidateRect(g_hList, nullptr, TRUE);
+	SL_SetItemHeight(g_hList, S(44));
+	SL_SetCount(g_hList, count);
 
 	if (count > 0)
 	{
@@ -2992,11 +3344,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 			WS_CHILD | WS_VISIBLE,
 			0, 0, 0, 0, hWnd, (HMENU)IDC_SUBS_BTN, nullptr, nullptr);
 
-		g_hList = CreateWindowW(L"LISTBOX", nullptr,
-			WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY |
-			LBS_OWNERDRAWFIXED | LBS_NOINTEGRALHEIGHT,
-			0, 0, 0, 0, hWnd, (HMENU)IDC_LIST, nullptr, nullptr);
-		SendMessageW(g_hList, LB_SETITEMHEIGHT, 0, ItemHeight());
+		g_hList = CreateSmoothList(hWnd, GetModuleHandleW(nullptr), IDC_LIST, true);
 
 		g_hStatus = CreateWindowW(L"STATIC", Tr(L"ready").c_str(),
 			WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS,
@@ -3007,7 +3355,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 			0, 0, 0, 0, hWnd, (HMENU)IDC_BACK_BTN, nullptr, nullptr);
 
 		g_hPlayerTitle = CreateWindowW(L"STATIC", L"",
-			WS_CHILD | SS_ENDELLIPSIS,
+			WS_CHILD | SS_ENDELLIPSIS | SS_NOTIFY,
 			0, 0, 0, 0, hWnd, (HMENU)IDC_PLAYER_TITLE, nullptr, nullptr);
 
 		g_hPlayPauseBtn = CreateWindowW(L"BUTTON", Tr(L"pause_btn").c_str(),
@@ -3027,11 +3375,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 			WS_CHILD,
 			0, 0, 0, 0, hWnd, (HMENU)IDC_FULLSCREEN_BTN, nullptr, nullptr);
 
-		g_hRecList = CreateWindowW(L"LISTBOX", nullptr,
-			WS_CHILD | WS_VSCROLL | LBS_NOTIFY |
-			LBS_OWNERDRAWFIXED | LBS_NOINTEGRALHEIGHT,
-			0, 0, 0, 0, hWnd, (HMENU)IDC_REC_LIST, nullptr, nullptr);
-		SendMessageW(g_hRecList, LB_SETITEMHEIGHT, 0, ItemHeight());
+		g_hRecList = CreateSmoothList(hWnd, GetModuleHandleW(nullptr), IDC_REC_LIST, false);
 
 		g_hStatsLabel = CreateWindowW(L"STATIC", L"",
 			WS_CHILD | SS_ENDELLIPSIS,
@@ -3166,25 +3510,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 		}
 		break;
 
-	case WM_MEASUREITEM:
+	case WM_MOUSEWHEEL:
 	{
-		MEASUREITEMSTRUCT* mis = (MEASUREITEMSTRUCT*)lp;
-		if (mis->CtlID == IDC_LIST || mis->CtlID == IDC_REC_LIST)
-		{
-			mis->itemHeight = ItemHeight();
-			return TRUE;
-		}
-		break;
-	}
-
-	case WM_DRAWITEM:
-	{
-		DRAWITEMSTRUCT* dis = (DRAWITEMSTRUCT*)lp;
-		if (dis->CtlID == IDC_LIST || dis->CtlID == IDC_REC_LIST)
-		{
-			DrawListItem(dis);
-			return TRUE;
-		}
+		// カーソル下のリストへホイールを転送 (フォーカスが無くてもスクロール可能に)
+		POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+		HWND target = WindowFromPoint(pt);
+		if (target == g_hList || target == g_hRecList)
+			return SendMessageW(target, WM_MOUSEWHEEL, wp, lp);
 		break;
 	}
 
@@ -3233,6 +3565,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 				OpenChannelVideos();
 			break;
 
+		case IDC_PLAYER_TITLE:
+			// 動画タイトルのクリック → 概要を表示
+			if (HIWORD(wp) == STN_CLICKED && g_playerMode)
+				OpenDescription();
+			break;
+
 		case IDC_MINI_THUMB:
 		case IDC_MINI_TITLE:
 			// ミニプレイヤーのクリック → 再生中の動画に戻る
@@ -3253,7 +3591,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 		case IDC_LIST:
 			if (HIWORD(wp) == LBN_DBLCLK)
 			{
-				int sel = (int)SendMessageW(g_hList, LB_GETCURSEL, 0, 0);
+				int sel = SL_GetSel(g_hList);
 				std::wstring videoId, title;
 				EnterCriticalSection(&g_cs);
 				if (sel >= 0 && sel < (int)g_results.size())
@@ -3274,7 +3612,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 		case IDC_REC_LIST:
 			if (HIWORD(wp) == LBN_DBLCLK)
 			{
-				int sel = (int)SendMessageW(g_hRecList, LB_GETCURSEL, 0, 0);
+				int sel = SL_GetSel(g_hRecList);
 				std::wstring videoId, title;
 				EnterCriticalSection(&g_cs);
 				if (sel >= 0 && sel < (int)g_recResults.size())
@@ -3294,11 +3632,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 		if ((LONG)wp == g_searchGen)
 		{
 			// 動画一覧モードに戻す (チャンネル一覧から遷移した場合)
-			if (g_listMode != 0)
-			{
-				g_listMode = 0;
-				SendMessageW(g_hList, LB_SETITEMHEIGHT, 0, ItemHeight());
-			}
+			g_listMode = 0;
 			FillResultList();
 
 			// サムネイル取得開始
@@ -3312,11 +3646,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 
 	case WM_APP_THUMB:
 		if ((LONG)lp == g_searchGen)
-		{
-			RECT rc;
-			if (SendMessageW(g_hList, LB_GETITEMRECT, wp, (LPARAM)&rc) != LB_ERR)
-				InvalidateRect(g_hList, &rc, TRUE);
-		}
+			SL_InvalidateItem(g_hList, (int)wp);
 		break;
 
 	case WM_APP_WATCHINFO:
@@ -3339,9 +3669,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 				Tr(IsSubscribed(chanId) ? L"subscribed_btn" : L"subscribe_btn").c_str());
 			EnableWindow(g_hSubBtn, !chanId.empty());
 
-			SendMessageW(g_hRecList, LB_RESETCONTENT, 0, 0);
-			for (int i = 0; i < count; i++)
-				SendMessageW(g_hRecList, LB_ADDSTRING, 0, (LPARAM)i);
+			SL_SetItemHeight(g_hRecList, ItemHeight());
+			SL_SetCount(g_hRecList, count);
 
 			if (count > 0)
 			{
@@ -3356,11 +3685,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp)
 
 	case WM_APP_RECTHUMB:
 		if ((LONG)lp == g_recGen)
-		{
-			RECT rc;
-			if (SendMessageW(g_hRecList, LB_GETITEMRECT, wp, (LPARAM)&rc) != LB_ERR)
-				InvalidateRect(g_hRecList, &rc, TRUE);
-		}
+			SL_InvalidateItem(g_hRecList, (int)wp);
 		break;
 
 	case WM_APP_CHANICON:
@@ -3464,10 +3789,28 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmd)
 	WNDCLASSW wcs = {};
 	wcs.lpfnWndProc = SettingsWndProc;
 	wcs.hInstance = hInst;
+	wcs.hIcon = hAppIcon;
 	wcs.hCursor = LoadCursor(nullptr, IDC_ARROW);
 	wcs.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
 	wcs.lpszClassName = L"YTLegacyRTSettings";
 	RegisterClassW(&wcs);
+
+	WNDCLASSW wcd = {};
+	wcd.lpfnWndProc = DescWndProc;
+	wcd.hInstance = hInst;
+	wcd.hIcon = hAppIcon;
+	wcd.hCursor = LoadCursor(nullptr, IDC_ARROW);
+	wcd.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+	wcd.lpszClassName = L"YTLegacyRTDesc";
+	RegisterClassW(&wcd);
+
+	WNDCLASSW wcl = {};
+	wcl.style = CS_DBLCLKS;
+	wcl.lpfnWndProc = SmoothListProc;
+	wcl.hInstance = hInst;
+	wcl.hCursor = LoadCursor(nullptr, IDC_ARROW);
+	wcl.lpszClassName = L"YTSmoothList";
+	RegisterClassW(&wcl);
 
 	HWND hWnd = CreateWindowW(
 		wc.lpszClassName,
